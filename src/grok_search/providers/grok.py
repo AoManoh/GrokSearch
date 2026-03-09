@@ -7,7 +7,7 @@ from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait
 from tenacity.wait import wait_base
 from zoneinfo import ZoneInfo
 from .base import BaseSearchProvider, SearchResult
-from ..utils import search_prompt, fetch_prompt
+from ..utils import search_prompt, fetch_prompt, url_describe_prompt, rank_sources_prompt
 from ..logger import log_info
 from ..config import config
 
@@ -131,19 +131,11 @@ class GrokSearchProvider(BaseSearchProvider):
             "Content-Type": "application/json",
         }
         platform_prompt = ""
-        return_prompt = ""
 
         if platform:
-            platform_prompt = "\n\nYou should search the web for the information you need, and focus on these platform: " + platform
+            platform_prompt = "\n\nYou should search the web for the information you need, and focus on these platform: " + platform + "\n"
 
-        if max_results:
-            return_prompt = "\n\nYou should return the results in a JSON format, and the results should at least be " + str(min_results) + " and at most be " + str(max_results) + " results."
-
-        # 仅在查询包含时间相关关键词时注入当前时间信息
-        if _needs_time_context(query):
-            time_context = get_local_time_info() + "\n"
-        else:
-            time_context = ""
+        time_context = get_local_time_info() + "\n"
 
         payload = {
             "model": self.model,
@@ -152,12 +144,12 @@ class GrokSearchProvider(BaseSearchProvider):
                     "role": "system",
                     "content": search_prompt,
                 },
-                {"role": "user", "content": time_context + query + platform_prompt + return_prompt },
+                {"role": "user", "content": time_context + query + platform_prompt},
             ],
             "stream": True,
         }
 
-        await log_info(ctx, f"platform_prompt: { query + platform_prompt + return_prompt}", config.debug_enabled)
+        await log_info(ctx, f"platform_prompt: { query + platform_prompt}", config.debug_enabled)
 
         return await self._execute_stream_with_retry(headers, payload, ctx)
 
@@ -240,3 +232,57 @@ class GrokSearchProvider(BaseSearchProvider):
                     ) as response:
                         response.raise_for_status()
                         return await self._parse_streaming_response(response, ctx)
+
+    async def describe_url(self, url: str, ctx=None) -> dict:
+        """让 Grok 阅读单个 URL 并返回 title + extracts"""
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": url_describe_prompt},
+                {"role": "user", "content": url},
+            ],
+            "stream": True,
+        }
+        result = await self._execute_stream_with_retry(headers, payload, ctx)
+        title, extracts = url, ""
+        for line in result.strip().splitlines():
+            if line.startswith("Title:"):
+                title = line[6:].strip() or url
+            elif line.startswith("Extracts:"):
+                extracts = line[9:].strip()
+        return {"title": title, "extracts": extracts, "url": url}
+
+    async def rank_sources(self, query: str, sources_text: str, total: int, ctx=None) -> list[int]:
+        """让 Grok 按查询相关度对信源排序，返回排序后的序号列表"""
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": rank_sources_prompt},
+                {"role": "user", "content": f"Query: {query}\n\n{sources_text}"},
+            ],
+            "stream": True,
+        }
+        result = await self._execute_stream_with_retry(headers, payload, ctx)
+        order: list[int] = []
+        seen: set[int] = set()
+        for token in result.strip().split():
+            try:
+                n = int(token)
+                if 1 <= n <= total and n not in seen:
+                    seen.add(n)
+                    order.append(n)
+            except ValueError:
+                continue
+        # 补齐遗漏的序号
+        for i in range(1, total + 1):
+            if i not in seen:
+                order.append(i)
+        return order
