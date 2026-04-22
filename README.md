@@ -13,6 +13,15 @@
 
 ---
 
+> **本仓库是 AoManoh 从 [GuDaStudio/GrokSearch](https://github.com/GuDaStudio/GrokSearch) fork 的内部维护分支。**
+>
+> - 当前在 `grok-with-tavily-aomanoh` 分支上叠加 **兼容性补丁**，仅供自用，**不会向上游提交 PR**
+> - 主线路始终跟踪 upstream `main`，补丁只做兼容性完善
+> - 当前已叠加补丁与同步流程详见文末 **[Fork 维护说明](#附录fork-维护说明)** 章节
+> - MCP 消费路径：`uvx git+https://github.com/AoManoh/GrokSearch@grok-with-tavily-aomanoh`
+
+---
+
 ## 一、概述
 
 Grok Search MCP 是一个基于 [FastMCP](https://github.com/jlowin/fastmcp) 构建的 MCP 服务器，采用**双引擎架构**：**Grok** 负责 AI 驱动的智能搜索，**Tavily** 负责高保真网页抓取与站点映射，各取所长为 Claude Code / Cherry Studio 等LLM Client提供完整的实时网络访问能力。
@@ -263,6 +272,59 @@ A: 在 Claude 对话中说"显示 grok-search 配置信息"，将自动测试 AP
 ## 许可证
 
 [MIT License](LICENSE)
+
+---
+
+## 附录：Fork 维护说明
+
+> 本附录仅适用于 `AoManoh/GrokSearch` fork 的 `grok-with-tavily-aomanoh` 分支，与上游 `GuDaStudio/GrokSearch` 无关。
+
+### 本 fork 的定位
+
+| 属性 | 值 |
+|---|---|
+| **上游 (upstream)** | `https://github.com/GuDaStudio/GrokSearch` |
+| **主线分支跟踪** | upstream `main` |
+| **补丁分支** | `grok-with-tavily-aomanoh`（基于 upstream main 叠加补丁） |
+| **向上游回流 PR** | ❌ 不做 |
+| **消费入口** | `uvx git+https://github.com/AoManoh/GrokSearch@grok-with-tavily-aomanoh` |
+
+原则：**主线路始终跟踪作者，我们只做内部兼容性完善**。
+
+### 当前已叠加的补丁
+
+| 补丁 | 涉及文件 | 目的 |
+|---|---|---|
+| **grok2api inline citation 解析** | `src/grok_search/sources.py`, `tests/test_sources.py` | 新增 `_split_inline_citations` 策略，识别 grok2api v2.0.4+ 返回的 `[[N]](url)` 格式引用，修复 `sources_count=0` 的旧 bug |
+| **破除循环导入** | `src/grok_search/utils.py` | 用 `from __future__ import annotations` + `TYPE_CHECKING` 延迟导入 `SearchResult`，让 `tests/test_sources.py` 可以脱离完整 provider chain 单独跑 |
+
+### 同步 upstream 最新代码
+
+upstream 每次发新版后，按以下流程 rebase 补丁分支：
+
+```bash
+# 在本地仓库执行（示例路径 c:\projects\grok\GrokSearch）
+git fetch upstream
+git checkout grok-with-tavily-aomanoh
+git rebase upstream/main
+git push --force-with-lease origin grok-with-tavily-aomanoh
+```
+
+### 冲突处理指引
+
+- **冲突集中在补丁涉及的 3 个文件** → 按补丁意图解决（保留 `_split_inline_citations` 策略和 `TYPE_CHECKING` 导入），然后继续 rebase
+- **冲突面扩大到其他文件** → 说明补丁已经偏离主线意图，重新评估是否要：
+  - **丢弃本地补丁**（如果 upstream 已合入等价修复）
+  - **抽成更小的 patch 重新叠加**
+
+### 验收补丁生效
+
+在 Claude Code / Cherry Studio / Windsurf 里调用 `web_search`，检查返回结构：
+
+- `sources_count > 0`（补丁生效前恒为 0）
+- `content` 仍保留 `[[N]](url)` inline 引用文本，未被破坏
+
+若 `sources_count` 仍为 0，先确认 Grok 返回的原始响应是否真的含 inline citation — 某些简单问题 Grok 会走 no-search 模式直接作答，不会产生引用。
 
 ---
 
