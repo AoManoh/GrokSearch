@@ -1,6 +1,10 @@
-from typing import List
+from __future__ import annotations
+
 import re
-from .providers.base import SearchResult
+from typing import TYPE_CHECKING, List
+
+if TYPE_CHECKING:
+    from .providers.base import SearchResult
 
 _URL_PATTERN = re.compile(r'https?://[^\s<>"\'`，。、；：！？》）】\)]+')
 
