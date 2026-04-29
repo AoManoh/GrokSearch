@@ -24,6 +24,12 @@ Claude --MCP--> Grok Search Server
                   └─ web_map     ---> Tavily Map (Site Mapping)
 ```
 
+### Current Fork Maintenance Boundary
+
+- `AoManoh/GrokSearch` is maintained independently by the current team and is the source of truth in this workspace for `GrokSearch` capabilities, documentation, acceptance results, and follow-up optimization plans.
+- This repository is not maintained with “prepare an upstream PR later” as the default workflow. Feature work, stability fixes, and release pacing are driven by this fork's own needs and validation results.
+- Upstream repositories may still be referenced for comparison or ideas, but they are not the default delivery target for ongoing work in this workspace.
+
 ### Features
 
 - **Dual Engine**: Grok search + Tavily extraction/mapping, complementary collaboration
@@ -76,46 +82,10 @@ claude mcp remove grok-search
 
 Replace the environment variables in the following command with your own values. The Grok endpoint must be OpenAI-compatible; Tavily is optional — `web_fetch` and `web_map` will be unavailable without it.
 
-#### GuDa Users (Recommended)
+If the upstream is `grok2api`, then:
 
-GuDa users only need to set `GUDA_API_KEY` to access all services — API URLs are automatically derived:
-
-```bash
-claude mcp add-json grok-search --scope user '{
-  "type": "stdio",
-  "command": "uvx",
-  "args": [
-    "--from",
-    "git+https://github.com/GuDaStudio/GrokSearch@grok-with-tavily",
-    "grok-search"
-  ],
-  "env": {
-    "GUDA_API_KEY": "your-guda-api-key"
-  }
-}'
-```
-
-#### Custom Configuration
-
-To use your own API endpoints, configure each service separately:
-
-```bash
-claude mcp add-json grok-search --scope user '{
-  "type": "stdio",
-  "command": "uvx",
-  "args": [
-    "--from",
-    "git+https://github.com/GuDaStudio/GrokSearch@grok-with-tavily",
-    "grok-search"
-  ],
-  "env": {
-    "GROK_API_URL": "https://your-api-endpoint.com/v1",
-    "GROK_API_KEY": "your-grok-api-key",
-    "TAVILY_API_KEY": "tvly-your-tavily-key",
-    "TAVILY_API_URL": "https://api.tavily.com"
-  }
-}'
-```
+- `GROK_API_URL=http(s)://<grok2api-host>/v1`
+- `GROK_API_KEY=<grok2api api key>`
 
 To export a cross-machine, cross-OS MCP JSON from this workspace, run:
 
@@ -125,6 +95,26 @@ uv run --directory /path/to/grok2api python scripts/export_groksearch_mcp_json.p
   --stdio-launcher portable \
   --base-url https://your-grok2api-host \
   --api-key your-grok2api-api-key
+```
+
+The maintained install source in this workspace currently points to `AoManoh/GrokSearch`:
+
+```bash
+claude mcp add-json grok-search --scope user '{
+  "type": "stdio",
+  "command": "uvx",
+  "args": [
+    "--from",
+    "git+https://github.com/AoManoh/GrokSearch@main",
+    "grok-search"
+  ],
+  "env": {
+    "GROK_API_URL": "https://your-api-endpoint.com/v1",
+    "GROK_API_KEY": "your-grok-api-key",
+    "TAVILY_API_KEY": "tvly-your-tavily-key",
+    "TAVILY_API_URL": "https://api.tavily.com"
+  }
+}'
 ```
 
 You can also configure additional environment variables in the `env` field:
@@ -298,5 +288,5 @@ A: Say "Show grok-search configuration info" in a Claude conversation to automat
 
 **If this project helps you, please give it a Star!**
 
-[![Star History Chart](https://api.star-history.com/svg?repos=GuDaStudio/GrokSearch&type=date&legend=top-left)](https://www.star-history.com/#GuDaStudio/GrokSearch&type=date&legend=top-left)
+[![Star History Chart](https://api.star-history.com/svg?repos=AoManoh/GrokSearch&type=date&legend=top-left)](https://www.star-history.com/#AoManoh/GrokSearch&type=date&legend=top-left)
 </div>

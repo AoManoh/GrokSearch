@@ -64,6 +64,14 @@ async def test_web_map_falls_back_to_basic_http(monkeypatch):
     assert payload["results"][0]["url"] == "https://example.com"
 
 
+def test_server_app_is_lazily_available():
+    app = server.app
+    with TestClient(app) as client:
+        health = client.get("/health")
+        assert health.status_code == 200
+        assert health.json()["status"] == "ok"
+
+
 def test_http_app_protects_mcp_route():
     app = server.create_http_app(mcp_path="/mcp", server_api_key="secret-token")
     with TestClient(app) as client:

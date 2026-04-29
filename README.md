@@ -24,6 +24,12 @@ Claude ──MCP──► Grok Search Server
                   └─ web_map     ───► Tavily Map（站点映射）
 ```
 
+### 当前 Fork 维护边界
+
+- `AoManoh/GrokSearch` 由当前维护团队独立维护，是当前工作区内 `GrokSearch` 能力、文档、验收结论和后续优化计划的事实源。
+- 本仓库默认不会向原作者仓库发起 PR；后续功能演进、稳定性修复和发布节奏以当前 fork 自身的需求和验证结果为准。
+- 如需参考原作者仓库或其他上游实现，应作为差异对照和思路来源，而不是当前开发任务的默认提交目标。
+
 ### 功能特性
 
 - **双引擎**：Grok 搜索 + Tavily 抓取/映射，互补协作
@@ -393,5 +399,5 @@ Q: 偶发 ConnectError / 调用结果被系统代理影响怎么办？
 
 **如果这个项目对您有帮助，请给个 Star！**
 
-[![Star History Chart](https://api.star-history.com/svg?repos=GuDaStudio/GrokSearch&type=date&legend=top-left)](https://www.star-history.com/#GuDaStudio/GrokSearch&type=date&legend=top-left)
+[![Star History Chart](https://api.star-history.com/svg?repos=AoManoh/GrokSearch&type=date&legend=top-left)](https://www.star-history.com/#AoManoh/GrokSearch&type=date&legend=top-left)
 </div>

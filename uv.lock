@@ -412,10 +412,7 @@ source = { editable = "." }
 dependencies = [
     { name = "fastmcp" },
     { name = "httpx", extra = ["socks"] },
-    { name = "mcp", extra = ["cli"] },
-    { name = "starlette" },
     { name = "tenacity" },
-    { name = "uvicorn" },
 ]
 
 [package.optional-dependencies]
@@ -428,12 +425,9 @@ dev = [
 requires-dist = [
     { name = "fastmcp", specifier = ">=2.3.0" },
     { name = "httpx", extras = ["socks"], specifier = ">=0.28.0" },
-    { name = "mcp", extras = ["cli"], specifier = ">=1.21.2" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23.0" },
-    { name = "starlette", specifier = ">=0.37.2" },
     { name = "tenacity", specifier = ">=8.0.0" },
-    { name = "uvicorn", specifier = ">=0.30.0" },
 ]
 provides-extras = ["dev"]
 

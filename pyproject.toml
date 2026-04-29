@@ -11,10 +11,7 @@ requires-python = ">=3.10"
 dependencies = [
     "fastmcp>=2.3.0",
     "httpx[socks]>=0.28.0",
-    "mcp[cli]>=1.21.2",
     "tenacity>=8.0.0",
-    "starlette>=0.37.2",
-    "uvicorn>=0.30.0",
 ]
 
 [project.optional-dependencies]
