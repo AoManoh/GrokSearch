@@ -117,6 +117,16 @@ claude mcp add-json grok-search --scope user '{
 }'
 ```
 
+To export a cross-machine, cross-OS MCP JSON from this workspace, run:
+
+```bash
+uv run --directory /path/to/grok2api python scripts/export_groksearch_mcp_json.py \
+  --client-transport stdio \
+  --stdio-launcher portable \
+  --base-url https://your-grok2api-host \
+  --api-key your-grok2api-api-key
+```
+
 You can also configure additional environment variables in the `env` field:
 
 | Variable | Required | Default | Description |
@@ -125,10 +135,10 @@ You can also configure additional environment variables in the `env` field:
 | `GUDA_BASE_URL` | No | `https://code.guda.studio` | GuDa service base URL |
 | `GROK_API_URL` | No | `{GUDA_BASE_URL}/grok/v1` | Grok API endpoint (OpenAI-compatible), overrides GuDa-derived value |
 | `GROK_API_KEY` | No | `{GUDA_API_KEY}` | Grok API key, overrides GuDa-derived value |
-| `GROK_MODEL` | No | `grok-4.20-beta` | Default model (takes precedence over `~/.config/grok-search/config.json` when set) |
+| `GROK_MODEL` | No | `grok-4.1-fast` | Default model (takes precedence over `~/.config/grok-search/config.json` when set) |
 | `TAVILY_API_KEY` | No | `{GUDA_API_KEY}` | Tavily API key (for web_fetch / web_map) |
 | `TAVILY_API_URL` | No | `{GUDA_BASE_URL}/tavily` | Tavily API endpoint |
-| `TAVILY_ENABLED` | No | `true` | Enable Tavily |
+| `TAVILY_ENABLED` | No | `true` | Enable Tavily; when set to `false`, runtime fully skips Tavily |
 | `FIRECRAWL_API_KEY` | No | `{GUDA_API_KEY}` | Firecrawl API key (fallback when Tavily fails) |
 | `FIRECRAWL_API_URL` | No | `{GUDA_BASE_URL}/firecrawl` | Firecrawl API endpoint |
 | `GROK_DEBUG` | No | `false` | Debug mode |
@@ -139,6 +149,20 @@ You can also configure additional environment variables in the `env` field:
 | `GROK_RETRY_MAX_WAIT` | No | `10` | Max retry wait in seconds |
 
 > **Note**: When `GUDA_API_KEY` is set, all `GROK_API_URL`/`GROK_API_KEY`/`TAVILY_*`/`FIRECRAWL_*` variables become optional as they are auto-derived from `GUDA_BASE_URL`. Explicitly set variables take higher priority.
+
+This repository also ships a copy-ready environment sample: [`.env.example`](../.env.example).
+
+### Remote HTTP MCP Service
+
+If you want to deploy `GrokSearch` as a shared remote MCP service instead of a local `stdio` process, see [REMOTE_MCP_SERVER.md](./REMOTE_MCP_SERVER.md).
+
+When the upstream is `grok2api`, the default `GET /ready` only verifies `/v1/models`. If you want readiness to reflect real chat/search usability, also set:
+
+```bash
+export MCP_READY_CHECKS="models,chat"
+```
+
+This makes `/ready` send a minimal streaming chat probe and return structured `upstream_status` fields for failures such as `403` or `502`.
 
 
 ### Verify Installation
@@ -177,8 +201,10 @@ Automatically detects time-related keywords in queries (e.g., "latest", "today",
 
 Return value (structured dict):
 - `session_id`: search session ID
+- `status`: `ok` or `error`
 - `content`: answer only (sources removed)
 - `sources_count`: cached sources count
+- `error`: only on failures; contains `code` / `message` / `provider` / `upstream_status`
 
 ### `get_sources` — Retrieve Sources
 
@@ -222,7 +248,7 @@ No parameters required. Displays all configuration status, tests Grok API connec
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `model` | string | Yes | Model ID (e.g., `"grok-4-fast"`, `"grok-2-latest"`) |
+| `model` | string | Yes | Model ID (e.g., `"grok-4.1-fast"`, `"grok-4"`) |
 
 Settings persist to `~/.config/grok-search/config.json` across sessions.
 

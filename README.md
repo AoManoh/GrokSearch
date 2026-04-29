@@ -74,6 +74,21 @@ claude mcp remove grok-search
 
 将以下命令中的环境变量替换为你自己的值后执行。Grok 接口需为 OpenAI 兼容格式；Tavily 为可选配置，未配置时工具 `web_fetch` 和 `web_map` 不可用。
 
+如果上游使用 `grok2api`，则：
+
+- `GROK_API_URL=http(s)://<grok2api-host>/v1`
+- `GROK_API_KEY=<grok2api api key>`
+
+若要从当前工作区导出一份跨机器、跨 OS 可复用的 MCP JSON，可执行：
+
+```bash
+uv run --directory /path/to/grok2api python scripts/export_groksearch_mcp_json.py \
+  --client-transport stdio \
+  --stdio-launcher portable \
+  --base-url https://your-grok2api-host \
+  --api-key your-grok2api-api-key
+```
+
 ```bash
 claude mcp add-json grok-search --scope user '{
   "type": "stdio",
@@ -125,10 +140,10 @@ claude mcp add-json grok-search --scope user '{
 |------|------|--------|------|
 | `GROK_API_URL` | ✅ | - | Grok API 地址（OpenAI 兼容格式） |
 | `GROK_API_KEY` | ✅ | - | Grok API 密钥 |
-| `GROK_MODEL` | ❌ | `grok-4-fast` | 默认模型（设置后优先于 `~/.config/grok-search/config.json`） |
+| `GROK_MODEL` | ❌ | `grok-4.1-fast` | 默认模型（设置后优先于 `~/.config/grok-search/config.json`） |
 | `TAVILY_API_KEY` | ❌ | - | Tavily API 密钥（用于 web_fetch / web_map） |
 | `TAVILY_API_URL` | ❌ | `https://api.tavily.com` | Tavily API 地址 |
-| `TAVILY_ENABLED` | ❌ | `true` | 是否启用 Tavily |
+| `TAVILY_ENABLED` | ❌ | `true` | 是否启用 Tavily；设为 `false` 后运行时将完全跳过 Tavily |
 | `FIRECRAWL_API_KEY` | ❌ | - | Firecrawl API 密钥（Tavily 失败时托底） |
 | `FIRECRAWL_API_URL` | ❌ | `https://api.firecrawl.dev/v2` | Firecrawl API 地址 |
 | `GROK_DEBUG` | ❌ | `false` | 调试模式 |
@@ -137,6 +152,20 @@ claude mcp add-json grok-search --scope user '{
 | `GROK_RETRY_MAX_ATTEMPTS` | ❌ | `3` | 最大重试次数 |
 | `GROK_RETRY_MULTIPLIER` | ❌ | `1` | 重试退避乘数 |
 | `GROK_RETRY_MAX_WAIT` | ❌ | `10` | 重试最大等待秒数 |
+
+当前仓库也提供了可直接复制的环境样例：[`.env.example`](./.env.example)。
+
+### 远程 HTTP MCP 服务
+
+若你希望把 `GrokSearch` 部署成共享远程 MCP，而不是本地 `stdio` 进程，请参考 [docs/REMOTE_MCP_SERVER.md](./docs/REMOTE_MCP_SERVER.md)。
+
+当上游使用 `grok2api` 时，默认 `GET /ready` 只验证 `/v1/models`。如果你要把 readiness 绑定到真实 chat/search 可用性，请额外设置：
+
+```bash
+export MCP_READY_CHECKS="models,chat"
+```
+
+这样 `/ready` 会额外发起一次最小流式聊天探针，并在 `403`、`502` 这类上游失败时返回结构化 `upstream_status`。
 
 
 ### 验证安装
@@ -175,8 +204,10 @@ claude mcp list
 
 返回值（结构化字典）：
 - `session_id`: 本次查询的会话 ID
+- `status`: `ok` 或 `error`
 - `content`: Grok 回答正文（已自动剥离信源）
 - `sources_count`: 已缓存的信源数量
+- `error`: 仅失败时返回，包含 `code` / `message` / `provider` / `upstream_status`
 
 ### `get_sources` — 获取信源
 
@@ -220,7 +251,7 @@ claude mcp list
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `model` | string | ✅ | 模型 ID（如 `"grok-4-fast"`, `"grok-2-latest"`） |
+| `model` | string | ✅ | 模型 ID（如 `"grok-4.1-fast"`, `"grok-4"`） |
 
 切换后配置持久化到 `~/.config/grok-search/config.json`，跨会话保持。
 
