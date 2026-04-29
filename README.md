@@ -95,7 +95,7 @@ claude mcp add-json grok-search --scope user '{
   "command": "uvx",
   "args": [
     "--from",
-    "git+https://github.com/GuDaStudio/GrokSearch@grok-with-tavily",
+    "git+https://github.com/AoManoh/GrokSearch@main",
     "grok-search"
   ],
   "env": {
@@ -122,7 +122,7 @@ claude mcp add-json grok-search --scope user '{
   "args": [
     "--native-tls",
     "--from",
-    "git+https://github.com/GuDaStudio/GrokSearch@grok-with-tavily",
+    "git+https://github.com/AoManoh/GrokSearch@main",
     "grok-search"
   ],
   "env": {
@@ -132,7 +132,47 @@ claude mcp add-json grok-search --scope user '{
     "TAVILY_API_URL": "https://api.tavily.com"
   }
 }'
-</details> ```
+</details> 
+
+<details>
+<summary><b>完整推荐配置参考（含 Tavily / Firecrawl 与代理隔离）</b></summary>
+
+适用于同时启用 Grok 搜索 + Tavily 抓取/映射 + Firecrawl 托底，并希望**不受用户操作系统代理影响**的场景。可直接复制到 Windsurf / Claude Code / Cherry Studio 等 MCP Host 的配置文件中：
+
+```json
+{
+  "grok-search": {
+    "command": "uvx",
+    "args": [
+      "--from",
+      "git+https://github.com/AoManoh/GrokSearch@main",
+      "grok-search"
+    ],
+    "disabled": false,
+    "env": {
+      "GROK_API_URL": "https://your-grok2api-host/v1",
+      "GROK_API_KEY": "your-key",
+      "GROK_MODEL": "grok-4.20-fast",
+      "GROK_SEARCH_PROVIDER": "chat",
+      "TAVILY_API_KEY": "tvly-your-tavily-key",
+      "TAVILY_ENABLED": "true",
+      "FIRECRAWL_API_KEY": "fc-your-firecrawl-key",
+      "HTTP_PROXY": "",
+      "HTTPS_PROXY": "",
+      "ALL_PROXY": "",
+      "NO_PROXY": "*"
+    }
+  }
+}
+```
+
+要点：
+
+- `GROK_SEARCH_PROVIDER=chat` 强制走 OpenAI 兼容 `/chat/completions`，避免 `auto` 在 hostname 命中 `api.x.ai` 时切到 `/responses`
+- `TAVILY_API_KEY` / `FIRECRAWL_API_KEY` 不要留空字符串，留空等同未设
+- `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` 用于把子进程的出站代理与用户系统代理解耦，详见下方常见问题
+
+</details>
 
 除此之外，你还可以在`env`字段中配置更多环境变量
 
@@ -152,6 +192,12 @@ claude mcp add-json grok-search --scope user '{
 | `GROK_RETRY_MAX_ATTEMPTS` | ❌ | `3` | 最大重试次数 |
 | `GROK_RETRY_MULTIPLIER` | ❌ | `1` | 重试退避乘数 |
 | `GROK_RETRY_MAX_WAIT` | ❌ | `10` | 重试最大等待秒数 |
+| `HTTP_PROXY` | ❌ | - | HTTP 出站代理（例如 `http://127.0.0.1:7890`） |
+| `HTTPS_PROXY` | ❌ | - | HTTPS 出站代理（例如 `http://127.0.0.1:7890`） |
+| `ALL_PROXY` | ❌ | - | 全协议出站代理 |
+| `NO_PROXY` | ❌ | - | 跳过代理的主机列表（逗号分隔，`*` 表示全部绕过） |
+
+> 提示：本服务所有外发请求均使用 `httpx`（默认 `trust_env=True`），会自动读取以上代理变量。MCP 子进程会继承启动方（如 Windsurf / Claude Code）的系统代理；如需隔离，请在 MCP 配置 `env` 中显式声明，详见下方"常见问题"。
 
 当前仓库也提供了可直接复制的环境样例：[`.env.example`](./.env.example)。
 
@@ -289,6 +335,52 @@ A: 需要 OpenAI 兼容格式的 API 地址（支持 `/chat/completions` 和 `/m
 Q: 如何验证配置？
 </summary>
 A: 在 Claude 对话中说"显示 grok-search 配置信息"，将自动测试 API 连接并显示结果。
+</details>
+
+<details>
+<summary>
+Q: 偶发 ConnectError / 调用结果被系统代理影响怎么办？
+</summary>
+
+本服务内部使用 `httpx` 且未关闭 `trust_env`，因此会自动读取启动进程的 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`。当 Claude Code、Windsurf、Cherry Studio 等 MCP Host 启动 `uvx grok-search` 子进程时，会**继承操作系统层面的代理变量**，可能与目标上游域名（例如国内自建 `grok2api`）冲突，表现为偶发 `ConnectError` 或上游不可达。
+
+在 MCP 配置 `env` 中显式覆盖即可隔离：
+
+**场景 1：上游在国内或局域网，需要绕过用户全局代理**
+
+```json
+"env": {
+  "GROK_API_URL": "https://your-grok2api-host/v1",
+  "GROK_API_KEY": "your-key",
+  "HTTP_PROXY": "",
+  "HTTPS_PROXY": "",
+  "ALL_PROXY": "",
+  "NO_PROXY": "*"
+}
+```
+
+也可以精细放行，仅对相关域名绕过：
+
+```json
+"NO_PROXY": "your-grok2api-host,api.tavily.com,api.firecrawl.dev"
+```
+
+**场景 2：MCP 子进程需要走专用代理**
+
+```json
+"env": {
+  "HTTPS_PROXY": "http://127.0.0.1:7890",
+  "HTTP_PROXY": "http://127.0.0.1:7890",
+  "NO_PROXY": "127.0.0.1,localhost,your-grok2api-host"
+}
+```
+
+**场景 3：完全沿用系统代理**
+
+不在 `env` 中声明任何代理变量即可，`httpx` 会自动从父进程环境读取。
+
+> 在某些操作系统下，向子进程传入空字符串可能等同于未设置；建议同时显式声明 `NO_PROXY=*` 以确保绕过。
+
 </details>
 
 ## 许可证
