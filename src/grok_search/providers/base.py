@@ -1,5 +1,16 @@
 from abc import ABC, abstractmethod
-from typing import Dict, List
+from dataclasses import dataclass, field
+from typing import Any, Dict, List
+
+
+@dataclass
+class SearchResponse:
+    answer: str = ""
+    sources: list[dict] = field(default_factory=list)
+    raw_content: str = ""
+    raw_metadata: dict[str, Any] = field(default_factory=dict)
+    provider: str = ""
+    model: str = ""
 
 
 class SearchResult:

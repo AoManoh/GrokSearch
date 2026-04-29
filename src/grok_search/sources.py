@@ -23,6 +23,7 @@ _SOURCES_HEADING_PATTERN = re.compile(
 _SOURCES_FUNCTION_PATTERN = re.compile(
     r"(?im)(^|\n)\s*(sources|source|citations|citation|references|reference|citation_card|source_cards|source_card)\s*\("
 )
+_INLINE_CITATION_PATTERN = re.compile(r"\[\[(\d+)\]\]\((https?://[^)\s]+)\)")
 
 
 def new_session_id() -> str:
@@ -85,6 +86,10 @@ def split_answer_and_sources(text: str) -> tuple[str, list[dict]]:
         return split
 
     split = _split_tail_link_block(raw)
+    if split:
+        return split
+
+    split = _split_inline_citations(raw)
     if split:
         return split
 
@@ -202,6 +207,35 @@ def _split_tail_link_block(text: str) -> tuple[str, list[dict]] | None:
 
     answer = "\n".join(lines[:tail_start]).rstrip()
     return answer, sources
+
+
+def _split_inline_citations(text: str) -> tuple[str, list[dict]] | None:
+    """Extract grok2api-style inline ``[[N]](url)`` citations from the body.
+
+    Grok2API (v2.0.4+) inlines citations like ``...fact [[1]](https://example.com)...``
+    instead of appending a trailing ``## Sources`` section. Earlier strategies
+    (``_split_heading_sources``, ``_split_tail_link_block``, etc.) require a
+    concentrated sources block and therefore miss these scattered references.
+
+    This strategy preserves the full answer text (inline citations are part of
+    the body's semantic content) and only harvests the cited URLs into the
+    sources list. Returns ``None`` when no inline citation is found, so callers
+    fall through to the empty-sources default.
+    """
+    sources: list[dict] = []
+    seen: set[str] = set()
+
+    for m in _INLINE_CITATION_PATTERN.finditer(text or ""):
+        url = m.group(2).strip().rstrip(".,;:!?")
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        sources.append({"url": url})
+
+    if not sources:
+        return None
+
+    return text, sources
 
 
 def _split_details_block_sources(text: str) -> tuple[str, list[dict]] | None:

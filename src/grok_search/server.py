@@ -1,5 +1,16 @@
+import argparse
+import asyncio
+import time
+import hmac
+import json
+import re
 import sys
+import time
+from collections import deque
+from html import unescape
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import urldefrag, urljoin, urlparse
 
 # 支持直接运行：添加 src 目录到 Python 路径
 src_dir = Path(__file__).parent.parent
@@ -9,28 +20,36 @@ if str(src_dir) not in sys.path:
 from fastmcp import FastMCP, Context
 from typing import Annotated, Optional
 from pydantic import Field
+from starlette.applications import Starlette
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse, PlainTextResponse
+from starlette.routing import Mount, Route
 
 # 尝试使用绝对导入（支持 mcp run）
 try:
-    from grok_search.providers.grok import GrokSearchProvider
+    from grok_search.providers.base import SearchResponse
+    from grok_search.providers.grok import GrokSearchProvider, UpstreamSSEError
+    from grok_search.providers.responses import ResponsesSearchProvider
     from grok_search.logger import log_info
     from grok_search.config import config
     from grok_search.sources import SourcesCache, merge_sources, new_session_id, split_answer_and_sources
     from grok_search.planning import engine as planning_engine, _split_csv
 except ImportError:
-    from .providers.grok import GrokSearchProvider
+    from .providers.base import SearchResponse
+    from .providers.grok import GrokSearchProvider, UpstreamSSEError
+    from .providers.responses import ResponsesSearchProvider
     from .logger import log_info
     from .config import config
     from .sources import SourcesCache, merge_sources, new_session_id, split_answer_and_sources
     from .planning import engine as planning_engine, _split_csv
 
-import asyncio
-
 mcp = FastMCP("grok-search")
 
 _SOURCES_CACHE = SourcesCache(max_size=256)
-_AVAILABLE_MODELS_CACHE: dict[tuple[str, str], list[str]] = {}
+_AVAILABLE_MODELS_CACHE: dict[tuple[str, str], tuple[list[str], float]] = {}
 _AVAILABLE_MODELS_LOCK = asyncio.Lock()
+_AVAILABLE_MODELS_CACHE_TTL_SECONDS = 300.0
 
 
 async def _fetch_available_models(api_url: str, api_key: str) -> list[str]:
@@ -57,18 +76,335 @@ async def _fetch_available_models(api_url: str, api_key: str) -> list[str]:
 
 async def _get_available_models_cached(api_url: str, api_key: str) -> list[str]:
     key = (api_url, api_key)
+    now = time.monotonic()
     async with _AVAILABLE_MODELS_LOCK:
-        if key in _AVAILABLE_MODELS_CACHE:
-            return _AVAILABLE_MODELS_CACHE[key]
+        cached = _AVAILABLE_MODELS_CACHE.get(key)
+        if cached:
+            models, expires_at = cached
+            if expires_at > now:
+                return models
+            _AVAILABLE_MODELS_CACHE.pop(key, None)
 
     try:
         models = await _fetch_available_models(api_url, api_key)
     except Exception:
         models = []
+        return models
 
     async with _AVAILABLE_MODELS_LOCK:
-        _AVAILABLE_MODELS_CACHE[key] = models
+        _AVAILABLE_MODELS_CACHE[key] = (
+            models,
+            time.monotonic() + _AVAILABLE_MODELS_CACHE_TTL_SECONDS,
+        )
     return models
+
+
+def _pick_fallback_model(available: list[str]) -> str:
+    preferred = [
+        config._apply_model_suffix(config._DEFAULT_MODEL),
+        config._DEFAULT_MODEL,
+        "grok-4.1-fast",
+        "grok-4",
+        "grok-4.1-mini",
+        "grok-3",
+    ]
+    for candidate in preferred:
+        if candidate in available:
+            return candidate
+    return available[0]
+
+
+def _resolve_search_provider_mode(api_url: str) -> str:
+    mode = config.grok_search_provider
+    if mode != "auto":
+        return mode
+    hostname = (urlparse(api_url).hostname or "").lower()
+    if hostname == "api.x.ai" or hostname.endswith(".api.x.ai"):
+        return "responses"
+    return "chat"
+
+
+def _build_search_provider(api_url: str, api_key: str, model: str):
+    provider_mode = _resolve_search_provider_mode(api_url)
+    if provider_mode == "responses":
+        return ResponsesSearchProvider(api_url, api_key, model), provider_mode
+    return GrokSearchProvider(api_url, api_key, model), provider_mode
+
+
+def _is_tavily_available() -> bool:
+    return config.tavily_enabled and bool(config.tavily_api_key)
+
+
+def _extract_upstream_status(exc: Exception) -> int | None:
+    status = getattr(exc, "upstream_status", None)
+    if isinstance(status, int):
+        return status
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    return status if isinstance(status, int) else None
+
+
+def _build_upstream_error(session_id: str, exc: Exception) -> dict:
+    message = str(exc).strip() or exc.__class__.__name__
+    error = {
+        "code": "upstream_error",
+        "message": f"Grok 上游请求失败: {message}",
+        "provider": "grok",
+        "retryable": False,
+    }
+
+    try:
+        import httpx
+    except Exception:  # pragma: no cover
+        httpx = None
+
+    if isinstance(exc, UpstreamSSEError):
+        error["message"] = f"Grok 上游流式错误: {message}"
+        if exc.upstream_status is not None:
+            error["retryable"] = exc.retryable
+            error["upstream_status"] = exc.upstream_status
+
+    if httpx is not None:
+        if isinstance(exc, httpx.TimeoutException):
+            error["code"] = "upstream_timeout"
+            error["retryable"] = True
+        elif isinstance(exc, httpx.RequestError):
+            error["code"] = "upstream_network_error"
+            error["retryable"] = True
+        elif isinstance(exc, httpx.HTTPStatusError):
+            status_code = exc.response.status_code
+            error["code"] = "upstream_http_error"
+            error["retryable"] = status_code in {408, 409, 425, 429, 500, 502, 503, 504}
+            error["upstream_status"] = status_code
+            body = exc.response.text[:200].strip()
+            if body:
+                error["message"] = f"Grok 上游返回 HTTP {status_code}: {body}"
+            else:
+                error["message"] = f"Grok 上游返回 HTTP {status_code}"
+
+    status_code = _extract_upstream_status(exc)
+    if status_code is not None and "upstream_status" not in error:
+        error["upstream_status"] = status_code
+
+    return {
+        "session_id": session_id,
+        "status": "error",
+        "content": error["message"],
+        "sources_count": 0,
+        "error": error,
+    }
+
+
+def _build_client_error(
+    session_id: str,
+    code: str,
+    message: str,
+    *,
+    provider: str = "server",
+) -> dict:
+    return {
+        "session_id": session_id,
+        "status": "error",
+        "content": message,
+        "sources_count": 0,
+        "error": {
+            "code": code,
+            "message": message,
+            "provider": provider,
+            "retryable": False,
+        },
+    }
+
+
+def _build_grok_provider(model: str = "") -> GrokSearchProvider | None:
+    try:
+        api_url = config.grok_api_url
+        api_key = config.grok_api_key
+    except ValueError:
+        return None
+    return GrokSearchProvider(api_url, api_key, model or config.grok_model)
+
+
+class _HtmlLinkParser(HTMLParser):
+    """提取页面标题和链接的极简 HTML 解析器。"""
+
+    def __init__(self):
+        super().__init__()
+        self.title = ""
+        self.links: list[str] = []
+        self._in_title = False
+
+    def handle_starttag(self, tag: str, attrs):
+        if tag.lower() == "title":
+            self._in_title = True
+            return
+        if tag.lower() != "a":
+            return
+        for key, value in attrs:
+            if key.lower() == "href" and value:
+                self.links.append(value)
+                break
+
+    def handle_endtag(self, tag: str):
+        if tag.lower() == "title":
+            self._in_title = False
+
+    def handle_data(self, data: str):
+        if self._in_title and data:
+            self.title += data
+
+
+def _strip_html_to_text(html: str) -> str:
+    """把 HTML 压成基础纯文本，作为最终降级输出。"""
+    content = re.sub(r"(?is)<(script|style).*?>.*?</\\1>", " ", html)
+    content = re.sub(r"(?i)</(p|div|section|article|li|h[1-6]|tr)>", "\n", content)
+    content = re.sub(r"(?s)<[^>]+>", " ", content)
+    content = unescape(content)
+    content = re.sub(r"[ \t]+", " ", content)
+    content = re.sub(r"\n{3,}", "\n\n", content)
+    return content.strip()
+
+
+def _normalize_target_url(raw_url: str, base_url: str) -> str | None:
+    candidate = raw_url.strip()
+    if not candidate:
+        return None
+    normalized = urldefrag(urljoin(base_url, candidate))[0]
+    parsed = urlparse(normalized)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return normalized
+
+
+async def _call_basic_http_fetch(url: str) -> str | None:
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+    except httpx.ConnectError as exc:
+        if "CERTIFICATE_VERIFY_FAILED" not in str(exc) and "certificate verify failed" not in str(exc).lower():
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, verify=False) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+    text = response.text or ""
+    if not text.strip():
+        return None
+
+    parser = _HtmlLinkParser()
+    try:
+        parser.feed(text)
+    except Exception:
+        parser = _HtmlLinkParser()
+
+    title = parser.title.strip() or url
+    body = _strip_html_to_text(text)
+    if not body:
+        return None
+    preview = body[:12000]
+    return f"# {title}\n\n来源：{response.url}\n\n{preview}"
+
+
+async def _call_basic_http_map(
+    url: str,
+    max_depth: int,
+    max_breadth: int,
+    limit: int,
+    timeout: int,
+    ctx: Context = None,
+) -> str:
+    import httpx
+
+    start = time.perf_counter()
+    base = _normalize_target_url(url, url)
+    if not base:
+        return json.dumps({"error": "invalid_url", "base_url": url}, ensure_ascii=False, indent=2)
+
+    parsed_base = urlparse(base)
+    queue = deque([(base, 0)])
+    queued = {base}
+    visited: set[str] = set()
+    results: list[dict] = []
+
+    try:
+        async def fetch_response(target: str):
+            try:
+                async with httpx.AsyncClient(timeout=float(timeout), follow_redirects=True) as client:
+                    response = await client.get(target)
+                    response.raise_for_status()
+                    return response
+            except httpx.ConnectError as exc:
+                if "CERTIFICATE_VERIFY_FAILED" not in str(exc) and "certificate verify failed" not in str(exc).lower():
+                    raise
+                async with httpx.AsyncClient(timeout=float(timeout), follow_redirects=True, verify=False) as client:
+                    response = await client.get(target)
+                    response.raise_for_status()
+                    return response
+
+        while queue and len(results) < limit:
+            current, depth = queue.popleft()
+            if current in visited:
+                continue
+            visited.add(current)
+
+            try:
+                response = await fetch_response(current)
+            except Exception as exc:
+                await log_info(ctx, f"basic map skip {current}: {exc}", config.debug_enabled)
+                continue
+
+            parser = _HtmlLinkParser()
+            try:
+                parser.feed(response.text or "")
+            except Exception:
+                pass
+
+            links: list[str] = []
+            for candidate in parser.links:
+                normalized = _normalize_target_url(candidate, str(response.url))
+                if not normalized:
+                    continue
+                parsed = urlparse(normalized)
+                if parsed.netloc != parsed_base.netloc:
+                    continue
+                if normalized not in links:
+                    links.append(normalized)
+                if depth + 1 < max_depth and normalized not in queued and len(queued) < limit * 4:
+                    queued.add(normalized)
+                    queue.append((normalized, depth + 1))
+                if len(links) >= max_breadth:
+                    break
+
+            results.append(
+                {
+                    "url": str(response.url),
+                    "title": parser.title.strip() or str(response.url),
+                    "depth": depth,
+                    "links": links,
+                    "provider": "basic-http",
+                }
+            )
+    except Exception as exc:
+        return json.dumps({"error": str(exc), "base_url": base}, ensure_ascii=False, indent=2)
+
+    return json.dumps(
+        {
+            "base_url": base,
+            "results": results,
+            "response_time": round(time.perf_counter() - start, 3),
+            "provider": "basic-http",
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 def _extra_results_to_sources(
@@ -137,20 +473,32 @@ async def web_search(
         api_key = config.grok_api_key
     except ValueError as e:
         await _SOURCES_CACHE.set(session_id, [])
-        return {"session_id": session_id, "content": f"配置错误: {str(e)}", "sources_count": 0}
+        return _build_client_error(
+            session_id,
+            "config_error",
+            f"配置错误: {str(e)}",
+            provider="config",
+        )
 
-    effective_model = config.grok_model
+    provider_mode = _resolve_search_provider_mode(api_url)
+    effective_model = config.grok_responses_model if provider_mode == "responses" else config.grok_model
+    available = await _get_available_models_cached(api_url, api_key)
     if model:
-        available = await _get_available_models_cached(api_url, api_key)
         if available and model not in available:
             await _SOURCES_CACHE.set(session_id, [])
-            return {"session_id": session_id, "content": f"无效模型: {model}", "sources_count": 0}
+            return _build_client_error(
+                session_id,
+                "invalid_model",
+                f"无效模型: {model}",
+            )
         effective_model = model
+    elif available and effective_model not in available:
+        effective_model = _pick_fallback_model(available)
 
-    grok_provider = GrokSearchProvider(api_url, api_key, effective_model)
+    grok_provider, provider_mode = _build_search_provider(api_url, api_key, effective_model)
 
     # 计算额外信源配额
-    has_tavily = bool(config.tavily_api_key)
+    has_tavily = _is_tavily_available()
     has_firecrawl = bool(config.firecrawl_api_key)
     firecrawl_count = 0
     tavily_count = 0
@@ -164,11 +512,22 @@ async def web_search(
             tavily_count = extra_sources
 
     # 并行执行搜索任务
-    async def _safe_grok() -> str:
+    async def _safe_grok() -> tuple[SearchResponse, dict | None]:
         try:
-            return await grok_provider.search(query, platform)
-        except Exception:
-            return ""
+            search_response = getattr(grok_provider, "search_response", None)
+            if callable(search_response):
+                return await search_response(query, platform), None
+            raw_content = await grok_provider.search(query, platform)
+            answer, sources = split_answer_and_sources(raw_content or "")
+            return SearchResponse(
+                answer=answer,
+                sources=sources,
+                raw_content=raw_content or "",
+                provider=getattr(grok_provider, "get_provider_name", lambda: provider_mode)(),
+                model=effective_model,
+            ), None
+        except Exception as exc:
+            return SearchResponse(provider=provider_mode, model=effective_model), _build_upstream_error(session_id, exc)
 
     async def _safe_tavily() -> list[dict] | None:
         try:
@@ -192,7 +551,7 @@ async def web_search(
 
     gathered = await asyncio.gather(*coros)
 
-    grok_result: str = gathered[0] or ""
+    grok_result, grok_error = gathered[0]
     tavily_results: list[dict] | None = None
     firecrawl_results: list[dict] | None = None
     idx = 1
@@ -202,12 +561,38 @@ async def web_search(
     if firecrawl_count > 0:
         firecrawl_results = gathered[idx]
 
-    answer, grok_sources = split_answer_and_sources(grok_result)
+    answer = grok_result.answer
+    grok_sources = grok_result.sources
     extra = _extra_results_to_sources(tavily_results, firecrawl_results)
     all_sources = merge_sources(grok_sources, extra)
 
     await _SOURCES_CACHE.set(session_id, all_sources)
-    return {"session_id": session_id, "content": answer, "sources_count": len(all_sources)}
+    if grok_error and not answer:
+        grok_error["sources_count"] = len(all_sources)
+        if all_sources:
+            grok_error["warning"] = "Grok 主搜索失败，仅缓存了额外信源，未生成主回答。"
+        return grok_error
+
+    status = "ok"
+    warning = None
+    if not answer:
+        if all_sources:
+            status = "partial"
+            warning = "Grok 上游返回了信源但没有正文。"
+        else:
+            status = "empty"
+
+    result = {
+        "session_id": session_id,
+        "status": status,
+        "content": answer,
+        "sources_count": len(all_sources),
+        "model": effective_model,
+        "provider": grok_result.provider or provider_mode,
+    }
+    if warning:
+        result["warning"] = warning
+    return result
 
 
 @mcp.tool(
@@ -360,10 +745,11 @@ async def web_fetch(
 ) -> str:
     await log_info(ctx, f"Begin Fetch: {url}", config.debug_enabled)
 
-    result = await _call_tavily_extract(url)
-    if result:
-        await log_info(ctx, "Fetch Finished (Tavily)!", config.debug_enabled)
-        return result
+    if config.tavily_enabled:
+        result = await _call_tavily_extract(url)
+        if result:
+            await log_info(ctx, "Fetch Finished (Tavily)!", config.debug_enabled)
+            return result
 
     await log_info(ctx, "Tavily unavailable or failed, trying Firecrawl...", config.debug_enabled)
     result = await _call_firecrawl_scrape(url, ctx)
@@ -371,9 +757,31 @@ async def web_fetch(
         await log_info(ctx, "Fetch Finished (Firecrawl)!", config.debug_enabled)
         return result
 
+    await log_info(ctx, "Extractor unavailable, trying Grok fetch...", config.debug_enabled)
+    grok_provider = _build_grok_provider()
+    if grok_provider:
+        try:
+            result = await grok_provider.fetch(url, ctx)
+            if result and result.strip():
+                await log_info(ctx, "Fetch Finished (Grok)!", config.debug_enabled)
+                return result
+        except Exception as exc:
+            await log_info(ctx, f"Grok fetch failed: {exc}", config.debug_enabled)
+
+    await log_info(ctx, "Grok fetch unavailable, trying raw HTTP fallback...", config.debug_enabled)
+    result = await _call_basic_http_fetch(url)
+    if result:
+        await log_info(ctx, "Fetch Finished (basic HTTP)!", config.debug_enabled)
+        return result
+
     await log_info(ctx, "Fetch Failed!", config.debug_enabled)
     if not config.tavily_api_key and not config.firecrawl_api_key:
-        return "配置错误: TAVILY_API_KEY 和 FIRECRAWL_API_KEY 均未配置"
+        try:
+            config.grok_api_url
+            config.grok_api_key
+            return "提取失败: Grok 与基础 HTTP 回退均未能获取内容"
+        except ValueError:
+            return "配置错误: GROK_API_URL / GROK_API_KEY 未配置，且 TAVILY_API_KEY / FIRECRAWL_API_KEY 均未配置"
     return "提取失败: 所有提取服务均未能获取内容"
 
 
@@ -433,8 +841,11 @@ async def web_map(
     limit: Annotated[int, Field(description="Total number of links to process before stopping.", ge=1, le=500)] = 50,
     timeout: Annotated[int, Field(description="Maximum time in seconds for the operation.", ge=10, le=150)] = 150
 ) -> str:
-    result = await _call_tavily_map(url, instructions, max_depth, max_breadth, limit, timeout)
-    return result
+    if _is_tavily_available():
+        result = await _call_tavily_map(url, instructions, max_depth, max_breadth, limit, timeout)
+        if not result.startswith("配置错误:"):
+            return result
+    return await _call_basic_http_map(url, max_depth, max_breadth, limit, timeout)
 
 
 @mcp.tool(
@@ -554,7 +965,7 @@ async def get_config_info() -> str:
     meta={"version": "1.3.0", "author": "guda.studio"},
 )
 async def switch_model(
-    model: Annotated[str, "Model ID to switch to (e.g., 'grok-4-fast', 'grok-2-latest', 'grok-vision-beta')."]
+    model: Annotated[str, "Model ID to switch to (e.g., 'grok-4.1-fast', 'grok-4', 'grok-vision-beta')."]
 ) -> str:
     import json
 
@@ -839,52 +1250,168 @@ async def plan_execution(
     ), ensure_ascii=False, indent=2)
 
 
-def main():
+class McpAuthMiddleware(BaseHTTPMiddleware):
+    """为远程 MCP 路径增加 Bearer/x-api-key 鉴权。"""
+
+    def __init__(self, app, path_prefix: str, api_key: str | None):
+        super().__init__(app)
+        self.path_prefix = config._normalize_mcp_path(path_prefix)
+        self.api_key = api_key
+
+    def _is_authorized(self, request: Request) -> bool:
+        if not self.api_key:
+            return True
+        authorization = (request.headers.get("authorization") or "").strip()
+        if authorization.lower().startswith("bearer "):
+            candidate = authorization[7:].strip()
+            return hmac.compare_digest(candidate, self.api_key)
+        x_api_key = (request.headers.get("x-api-key") or "").strip()
+        if x_api_key:
+            return hmac.compare_digest(x_api_key, self.api_key)
+        return False
+
+    async def dispatch(self, request: Request, call_next):
+        if not request.url.path.startswith(self.path_prefix):
+            return await call_next(request)
+        if request.method == "OPTIONS" or self._is_authorized(request):
+            return await call_next(request)
+        return JSONResponse(
+            {"detail": "Unauthorized"},
+            status_code=401,
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+async def _health(_request: Request):
+    return JSONResponse({"status": "ok", "transport": "http"})
+
+
+async def _index(_request: Request):
+    return PlainTextResponse("grok-search mcp")
+
+
+def create_http_app(
+    mcp_path: str | None = None,
+    server_api_key: str | None = None,
+):
+    mount_path = config._normalize_mcp_path(mcp_path or config.mcp_http_path)
+    inner_app = mcp.http_app(path=mount_path, transport="streamable-http")
+    app = Starlette(
+        lifespan=inner_app.lifespan,
+        routes=[
+            Route("/health", _health),
+            Route("/", _index),
+            Mount("/", app=inner_app),
+        ]
+    )
+    app.add_middleware(
+        McpAuthMiddleware,
+        path_prefix=mount_path,
+        api_key=server_api_key if server_api_key is not None else config.mcp_server_api_key,
+    )
+    return app
+
+
+app = create_http_app()
+
+
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Run Grok Search MCP over stdio or HTTP.")
+    parser.add_argument(
+        "--transport",
+        choices=("stdio", "http", "streamable-http"),
+        default=config.mcp_transport,
+        help="MCP transport mode",
+    )
+    parser.add_argument("--host", default=config.mcp_http_host, help="HTTP bind host")
+    parser.add_argument("--port", type=int, default=config.mcp_http_port, help="HTTP bind port")
+    parser.add_argument("--path", default=config.mcp_http_path, help="HTTP MCP path")
+    return parser.parse_args(argv)
+
+
+def _install_signal_handlers():
+    import os
     import signal
+    import threading
+
+    if threading.current_thread() is not threading.main_thread():
+        return
+
+    def handle_shutdown(_signum, _frame):
+        os._exit(0)
+
+    signal.signal(signal.SIGINT, handle_shutdown)
+    if sys.platform != "win32":
+        signal.signal(signal.SIGTERM, handle_shutdown)
+
+
+def _start_windows_parent_monitor():
+    import ctypes
     import os
     import threading
 
-    # 信号处理（仅主线程）
-    if threading.current_thread() is threading.main_thread():
-        def handle_shutdown(signum, frame):
-            os._exit(0)
-        signal.signal(signal.SIGINT, handle_shutdown)
-        if sys.platform != 'win32':
-            signal.signal(signal.SIGTERM, handle_shutdown)
+    if sys.platform != "win32":
+        return
 
-    # Windows 父进程监控
-    if sys.platform == 'win32':
-        import time
-        import ctypes
-        parent_pid = os.getppid()
+    parent_pid = os.getppid()
 
-        def is_parent_alive(pid):
-            """Windows 下检查进程是否存活"""
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            STILL_ACTIVE = 259
-            kernel32 = ctypes.windll.kernel32
-            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-            if not handle:
-                return True
-            exit_code = ctypes.c_ulong()
-            result = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
-            kernel32.CloseHandle(handle)
-            return result and exit_code.value == STILL_ACTIVE
+    def is_parent_alive(pid):
+        """Windows 下检查进程是否存活。"""
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return True
+        exit_code = ctypes.c_ulong()
+        result = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+        kernel32.CloseHandle(handle)
+        return result and exit_code.value == STILL_ACTIVE
 
-        def monitor_parent():
-            while True:
-                if not is_parent_alive(parent_pid):
-                    os._exit(0)
-                time.sleep(2)
+    def monitor_parent():
+        while True:
+            if not is_parent_alive(parent_pid):
+                os._exit(0)
+            time.sleep(2)
 
-        threading.Thread(target=monitor_parent, daemon=True).start()
+    threading.Thread(target=monitor_parent, daemon=True).start()
 
+
+def _run_stdio():
+    import os
+
+    _start_windows_parent_monitor()
     try:
         mcp.run(transport="stdio", show_banner=False)
     except KeyboardInterrupt:
         pass
     finally:
         os._exit(0)
+
+
+def _run_http(host: str, port: int, path: str):
+    import uvicorn
+
+    http_app = create_http_app(mcp_path=path)
+    uvicorn.run(
+        http_app,
+        host=host,
+        port=port,
+        log_level=config.log_level.lower(),
+    )
+
+
+def main(argv=None):
+    args = _parse_args(argv)
+    _install_signal_handlers()
+    if args.transport in {"http", "streamable-http"}:
+        _run_http(args.host, args.port, args.path)
+        return
+    _run_stdio()
+
+
+def main_http():
+    main(["--transport", "http"])
 
 
 if __name__ == "__main__":

@@ -1,15 +1,17 @@
 import httpx
 import json
+import re
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import List, Optional
 from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait_random_exponential
 from tenacity.wait import wait_base
 from zoneinfo import ZoneInfo
-from .base import BaseSearchProvider, SearchResult
+from .base import BaseSearchProvider, SearchResponse, SearchResult
 from ..utils import search_prompt, fetch_prompt, url_describe_prompt, rank_sources_prompt
 from ..logger import log_info
 from ..config import config
+from ..sources import split_answer_and_sources
 
 
 def get_local_time_info() -> str:
@@ -69,6 +71,37 @@ def _needs_time_context(query: str) -> bool:
 
 RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
+_STATUS_PATTERNS = (
+    re.compile(r"\bHTTP\s+([1-5]\d{2})\b", re.IGNORECASE),
+    re.compile(r"\bstatus(?:=|:)?\s*([1-5]\d{2})\b", re.IGNORECASE),
+    re.compile(r"\b(?:failed|error|redirect(?:ed)?)\b[^0-9]{0,12}([1-5]\d{2})\b", re.IGNORECASE),
+    re.compile(r",\s*([1-5]\d{2})(?:\D|$)"),
+)
+
+
+def _extract_status_from_message(message: str) -> Optional[int]:
+    for pattern in _STATUS_PATTERNS:
+        match = pattern.search(message)
+        if not match:
+            continue
+        status_code = int(match.group(1))
+        if 300 <= status_code <= 599:
+            return status_code
+    return None
+
+
+class UpstreamSSEError(RuntimeError):
+    """保留流式错误中的上游状态码，便于外层做结构化透传。"""
+
+    def __init__(self, message: str, *, upstream_status: int | None = None):
+        super().__init__(message)
+        self.upstream_status = upstream_status
+        self.retryable = (
+            upstream_status in RETRYABLE_STATUS_CODES
+            if upstream_status is not None
+            else False
+        )
+
 
 def _is_retryable_exception(exc) -> bool:
     """检查异常是否可重试"""
@@ -118,7 +151,7 @@ class _WaitWithRetryAfter(wait_base):
 
 
 class GrokSearchProvider(BaseSearchProvider):
-    def __init__(self, api_url: str, api_key: str, model: str = "grok-4-fast"):
+    def __init__(self, api_url: str, api_key: str, model: str = "grok-4.1-fast"):
         super().__init__(api_url, api_key)
         self.model = model
 
@@ -153,6 +186,17 @@ class GrokSearchProvider(BaseSearchProvider):
 
         return await self._execute_stream_with_retry(headers, payload, ctx)
 
+    async def search_response(self, query: str, platform: str = "", min_results: int = 3, max_results: int = 10, ctx=None) -> SearchResponse:
+        raw_content = await self.search(query, platform, min_results, max_results, ctx)
+        answer, sources = split_answer_and_sources(raw_content or "")
+        return SearchResponse(
+            answer=answer,
+            sources=sources,
+            raw_content=raw_content or "",
+            provider=self.get_provider_name(),
+            model=self.model,
+        )
+
     async def fetch(self, url: str, ctx=None) -> str:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -174,6 +218,7 @@ class GrokSearchProvider(BaseSearchProvider):
     async def _parse_streaming_response(self, response, ctx=None) -> str:
         content = ""
         full_body_buffer = [] 
+        current_event = "message"
         
         async for line in response.aiter_lines():
             line = line.strip()
@@ -182,19 +227,45 @@ class GrokSearchProvider(BaseSearchProvider):
             
             full_body_buffer.append(line)
 
+            if line.startswith("event:"):
+                current_event = line[6:].strip() or "message"
+                continue
+
             # 兼容 "data: {...}" 和 "data:{...}" 两种 SSE 格式
             if line.startswith("data:"):
                 if line in ("data: [DONE]", "data:[DONE]"):
-                    continue
+                    break
                 try:
                     # 去掉 "data:" 前缀，并去除可能的空格
                     json_str = line[5:].lstrip()
                     data = json.loads(json_str)
+                    if current_event == "error" or "error" in data:
+                        error = data.get("error") or {}
+                        if isinstance(error, dict):
+                            message = str(error.get("message") or error).strip()
+                            raw_status = error.get("status") or error.get("upstream_status")
+                        else:
+                            message = str(error).strip()
+                            raw_status = None
+
+                        upstream_status = None
+                        if isinstance(raw_status, int) and 300 <= raw_status <= 599:
+                            upstream_status = raw_status
+                        elif isinstance(raw_status, str):
+                            upstream_status = _extract_status_from_message(raw_status)
+                        if upstream_status is None:
+                            upstream_status = _extract_status_from_message(message)
+
+                        raise UpstreamSSEError(
+                            message or "Unknown upstream SSE error",
+                            upstream_status=upstream_status,
+                        )
                     choices = data.get("choices", [])
                     if choices and len(choices) > 0:
                         delta = choices[0].get("delta", {})
                         if "content" in delta:
                             content += delta["content"]
+                    current_event = "message"
                 except (json.JSONDecodeError, IndexError):
                     continue
                 
