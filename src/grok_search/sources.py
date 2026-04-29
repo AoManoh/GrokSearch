@@ -7,9 +7,8 @@ from typing import Any
 
 import asyncio
 
-from .utils import extract_unique_urls
 
-
+_URL_PATTERN = re.compile(r"https?://[^\s<>\"'`，。、；：！？》）】)]+")
 _MD_LINK_PATTERN = re.compile(r"\[([^\]]+)\]\((https?://[^)]+)\)")
 _SOURCES_HEADING_PATTERN = re.compile(
     r"(?im)^"
@@ -24,6 +23,17 @@ _SOURCES_FUNCTION_PATTERN = re.compile(
     r"(?im)(^|\n)\s*(sources|source|citations|citation|references|reference|citation_card|source_cards|source_card)\s*\("
 )
 _INLINE_CITATION_PATTERN = re.compile(r"\[\[(\d+)\]\]\((https?://[^)\s]+)\)")
+
+
+def _extract_unique_urls(text: str) -> list[str]:
+    seen: set[str] = set()
+    urls: list[str] = []
+    for match in _URL_PATTERN.finditer(text):
+        url = match.group().rstrip('.,;:!?')
+        if url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
 
 
 def new_session_id() -> str:
@@ -311,7 +321,7 @@ def _normalize_sources(data: Any) -> list[dict]:
 
     for item in items:
         if isinstance(item, str):
-            for url in extract_unique_urls(item):
+            for url in _extract_unique_urls(item):
                 if url not in seen:
                     seen.add(url)
                     normalized.append({"url": url})
@@ -362,7 +372,7 @@ def _extract_sources_from_text(text: str) -> list[dict]:
         else:
             sources.append({"url": url})
 
-    for url in extract_unique_urls(text or ""):
+    for url in _extract_unique_urls(text or ""):
         if url in seen:
             continue
         seen.add(url)

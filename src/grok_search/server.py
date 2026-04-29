@@ -1,11 +1,9 @@
 import argparse
 import asyncio
 import time
-import hmac
 import json
 import re
 import sys
-import time
 from collections import deque
 from html import unescape
 from html.parser import HTMLParser
@@ -20,11 +18,6 @@ if str(src_dir) not in sys.path:
 from fastmcp import FastMCP, Context
 from typing import Annotated, Optional
 from pydantic import Field
-from starlette.applications import Starlette
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from starlette.responses import JSONResponse, PlainTextResponse
-from starlette.routing import Mount, Route
 
 # 尝试使用绝对导入（支持 mcp run）
 try:
@@ -1250,69 +1243,39 @@ async def plan_execution(
     ), ensure_ascii=False, indent=2)
 
 
-class McpAuthMiddleware(BaseHTTPMiddleware):
-    """为远程 MCP 路径增加 Bearer/x-api-key 鉴权。"""
-
-    def __init__(self, app, path_prefix: str, api_key: str | None):
-        super().__init__(app)
-        self.path_prefix = config._normalize_mcp_path(path_prefix)
-        self.api_key = api_key
-
-    def _is_authorized(self, request: Request) -> bool:
-        if not self.api_key:
-            return True
-        authorization = (request.headers.get("authorization") or "").strip()
-        if authorization.lower().startswith("bearer "):
-            candidate = authorization[7:].strip()
-            return hmac.compare_digest(candidate, self.api_key)
-        x_api_key = (request.headers.get("x-api-key") or "").strip()
-        if x_api_key:
-            return hmac.compare_digest(x_api_key, self.api_key)
-        return False
-
-    async def dispatch(self, request: Request, call_next):
-        if not request.url.path.startswith(self.path_prefix):
-            return await call_next(request)
-        if request.method == "OPTIONS" or self._is_authorized(request):
-            return await call_next(request)
-        return JSONResponse(
-            {"detail": "Unauthorized"},
-            status_code=401,
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-
-async def _health(_request: Request):
-    return JSONResponse({"status": "ok", "transport": "http"})
-
-
-async def _index(_request: Request):
-    return PlainTextResponse("grok-search mcp")
-
-
 def create_http_app(
     mcp_path: str | None = None,
     server_api_key: str | None = None,
 ):
-    mount_path = config._normalize_mcp_path(mcp_path or config.mcp_http_path)
-    inner_app = mcp.http_app(path=mount_path, transport="streamable-http")
-    app = Starlette(
-        lifespan=inner_app.lifespan,
-        routes=[
-            Route("/health", _health),
-            Route("/", _index),
-            Mount("/", app=inner_app),
-        ]
+    from grok_search.http_service import (
+        DEFAULT_MCP_CONFIG_PATH,
+        DEFAULT_MCP_HEALTH_PATH,
+        DEFAULT_MCP_READY_PATH,
+        HttpServiceSettings,
+        build_http_app,
     )
-    app.add_middleware(
-        McpAuthMiddleware,
-        path_prefix=mount_path,
-        api_key=server_api_key if server_api_key is not None else config.mcp_server_api_key,
+
+    api_key = server_api_key if server_api_key is not None else config.mcp_server_api_key
+    return build_http_app(
+        HttpServiceSettings(
+            host=config.mcp_http_host,
+            port=config.mcp_http_port,
+            path=config._normalize_mcp_path(mcp_path or config.mcp_http_path),
+            transport="streamable-http",
+            public_base_url=None,
+            api_keys=(api_key,) if api_key else (),
+            health_path=DEFAULT_MCP_HEALTH_PATH,
+            ready_path=DEFAULT_MCP_READY_PATH,
+            config_path=DEFAULT_MCP_CONFIG_PATH,
+            ready_checks=("models",),
+        )
     )
-    return app
 
 
-app = create_http_app()
+def __getattr__(name: str):
+    if name == "app":
+        return create_http_app()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _parse_args(argv=None):
