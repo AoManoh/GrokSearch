@@ -1,5 +1,7 @@
 import json
 import sys
+import time
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -39,6 +41,41 @@ async def test_web_fetch_falls_back_to_grok(monkeypatch):
     result = await server.web_fetch("https://example.com/article")
     assert "# fetched" in result
     assert "https://example.com/article" in result
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_timeout_cuts_off_grok_fetch(monkeypatch):
+    monkeypatch.setenv("GROK_API_URL", "http://example.com/v1")
+    monkeypatch.setenv("GROK_API_KEY", "test-key")
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+
+    async def fake_tavily(_url):
+        return None
+
+    async def fake_firecrawl(_url, _ctx=None):
+        return None
+
+    class SlowProvider:
+        async def fetch(self, url, ctx=None):
+            await asyncio.sleep(60)
+            return f"# fetched\n\n{url}"
+
+    async def fail_basic_fetch(_url, timeout=30.0):
+        raise AssertionError("basic fallback should not run after total fetch timeout")
+
+    monkeypatch.setattr(server, "_call_tavily_extract", fake_tavily)
+    monkeypatch.setattr(server, "_call_firecrawl_scrape", fake_firecrawl)
+    monkeypatch.setattr(server, "_build_grok_provider", lambda model="": SlowProvider())
+    monkeypatch.setattr(server, "_call_basic_http_fetch", fail_basic_fetch)
+
+    started = time.perf_counter()
+    result = await server.web_fetch("https://example.com/article", timeout="500ms")
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 3.0
+    assert "提取超时" in result
+    assert "0.5s" in result
 
 
 @pytest.mark.asyncio

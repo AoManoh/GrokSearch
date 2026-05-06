@@ -8,6 +8,7 @@ from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait
 from tenacity.wait import wait_base
 from zoneinfo import ZoneInfo
 from .base import BaseSearchProvider, SearchResponse, SearchResult
+from ._concurrency import get_grok_semaphore, maybe_acquire_grok_semaphore
 from ..utils import search_prompt, fetch_prompt, url_describe_prompt, rank_sources_prompt
 from ..logger import log_info
 from ..config import config
@@ -287,22 +288,26 @@ class GrokSearchProvider(BaseSearchProvider):
         """执行带重试机制的流式 HTTP 请求"""
         timeout = httpx.Timeout(connect=6.0, read=120.0, write=10.0, pool=None)
 
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            async for attempt in AsyncRetrying(
-                stop=stop_after_attempt(config.retry_max_attempts + 1),
-                wait=_WaitWithRetryAfter(config.retry_multiplier, config.retry_max_wait),
-                retry=retry_if_exception(_is_retryable_exception),
-                reraise=True,
-            ):
-                with attempt:
-                    async with client.stream(
-                        "POST",
-                        f"{self.api_url}/chat/completions",
-                        headers=headers,
-                        json=payload,
-                    ) as response:
-                        response.raise_for_status()
-                        return await self._parse_streaming_response(response, ctx)
+        # 注意：用 maybe_acquire_grok_semaphore，让外层在 asyncio.wait_for 之外
+        # 通过 hold_grok_semaphore 提前持锁的场景能复用 slot；否则保持原有
+        # 限流语义。这是 2026-05-06 stress test P0 修复的内层一半。
+        async with maybe_acquire_grok_semaphore():
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                async for attempt in AsyncRetrying(
+                    stop=stop_after_attempt(config.retry_max_attempts + 1),
+                    wait=_WaitWithRetryAfter(config.retry_multiplier, config.retry_max_wait),
+                    retry=retry_if_exception(_is_retryable_exception),
+                    reraise=True,
+                ):
+                    with attempt:
+                        async with client.stream(
+                            "POST",
+                            f"{self.api_url}/chat/completions",
+                            headers=headers,
+                            json=payload,
+                        ) as response:
+                            response.raise_for_status()
+                            return await self._parse_streaming_response(response, ctx)
 
     async def describe_url(self, url: str, ctx=None) -> dict:
         """让 Grok 阅读单个 URL 并返回 title + extracts"""

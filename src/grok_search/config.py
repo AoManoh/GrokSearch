@@ -77,6 +77,37 @@ class Config:
         return int(os.getenv("GROK_RETRY_MAX_WAIT", "10"))
 
     @property
+    def grok_concurrency(self) -> int:
+        try:
+            value = int(os.getenv("GROK_CONCURRENCY", "4"))
+        except ValueError:
+            value = 4
+        if value < 1:
+            value = 1
+        if value > 32:
+            value = 32
+        return value
+
+    @property
+    def grok_request_timeout(self) -> float:
+        """单次上游搜索请求的总时长上限（秒）。
+
+        作为 server 默认值使用——AI 在调用 web_search / web_search_batch /
+        submit_search_task 时可以传 ``timeout`` 参数（Go 风格 duration）覆盖。
+        默认 120s，可由环境变量 ``GROK_REQUEST_TIMEOUT`` 覆盖；最终被 clamp
+        到 [5, 600] 秒区间。
+        """
+        try:
+            value = float(os.getenv("GROK_REQUEST_TIMEOUT", "120"))
+        except ValueError:
+            value = 120.0
+        if value < 5.0:
+            value = 5.0
+        if value > 600.0:
+            value = 600.0
+        return value
+
+    @property
     def mcp_transport(self) -> str:
         value = os.getenv("GROK_MCP_TRANSPORT", "stdio").strip().lower()
         return value if value in ("stdio", "http", "streamable-http") else "stdio"
@@ -237,6 +268,8 @@ class Config:
             "GROK_MCP_PATH": self.mcp_http_path,
             "GROK_MCP_SERVER_API_KEY": self._mask_api_key(self.mcp_server_api_key) if self.mcp_server_api_key else "未配置",
             "GROK_SEARCH_PROVIDER": self.grok_search_provider,
+            "GROK_CONCURRENCY": self.grok_concurrency,
+            "GROK_REQUEST_TIMEOUT": self.grok_request_timeout,
             "GROK_MODEL": self.grok_model,
             "GROK_RESPONSES_MODEL": self.grok_responses_model,
             "GROK_DEBUG": self.debug_enabled,

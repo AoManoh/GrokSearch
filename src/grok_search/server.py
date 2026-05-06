@@ -24,18 +24,40 @@ try:
     from grok_search.providers.base import SearchResponse
     from grok_search.providers.grok import GrokSearchProvider, UpstreamSSEError
     from grok_search.providers.responses import ResponsesSearchProvider
+    from grok_search.providers._concurrency import hold_grok_semaphore
     from grok_search.logger import log_info
     from grok_search.config import config
     from grok_search.sources import SourcesCache, merge_sources, new_session_id, split_answer_and_sources
     from grok_search.planning import engine as planning_engine, _split_csv
+    from grok_search.task_store import (
+        TASK_STATE_CANCELLED,
+        TASK_STATE_COMPLETED,
+        TASK_STATE_FAILED,
+        TASK_STATE_QUEUED,
+        TASK_STATE_RUNNING,
+        VALID_KINDS as _TASK_VALID_KINDS,
+        get_task_store,
+        parse_go_duration,
+    )
 except ImportError:
     from .providers.base import SearchResponse
     from .providers.grok import GrokSearchProvider, UpstreamSSEError
     from .providers.responses import ResponsesSearchProvider
+    from .providers._concurrency import hold_grok_semaphore
     from .logger import log_info
     from .config import config
     from .sources import SourcesCache, merge_sources, new_session_id, split_answer_and_sources
     from .planning import engine as planning_engine, _split_csv
+    from .task_store import (
+        TASK_STATE_CANCELLED,
+        TASK_STATE_COMPLETED,
+        TASK_STATE_FAILED,
+        TASK_STATE_QUEUED,
+        TASK_STATE_RUNNING,
+        VALID_KINDS as _TASK_VALID_KINDS,
+        get_task_store,
+        parse_go_duration,
+    )
 
 mcp = FastMCP("grok-search")
 
@@ -209,6 +231,64 @@ def _build_client_error(
     }
 
 
+def _build_timeout_error(session_id: str, timeout_seconds: float) -> dict:
+    """单次上游搜索请求超出 ``timeout_seconds`` 后返回的结构化错误。
+
+    设计原则：超时是 retryable 的——AI 看到 ``upstream_timeout`` 时可以选择
+    用更大的 ``timeout`` 参数重试同一条 query，或换更轻量的搜索策略。
+    """
+    message = f"Grok 上游请求在 {timeout_seconds:.1f}s 内未返回，已被 server 切断。"
+    return {
+        "session_id": session_id,
+        "status": "error",
+        "content": message,
+        "sources_count": 0,
+        "error": {
+            "code": "upstream_timeout",
+            "message": message,
+            "provider": "grok",
+            "retryable": True,
+            "timeout_seconds": timeout_seconds,
+        },
+    }
+
+
+def _build_skipped_search_result(session_id: str, code: str, message: str) -> dict:
+    return {
+        "session_id": session_id,
+        "status": "skipped",
+        "content": "",
+        "sources_count": 0,
+        "error": {
+            "code": code,
+            "message": message,
+            "provider": "server",
+            "retryable": False,
+        },
+    }
+
+
+def _classify_query_skip_reason(query: str) -> str | None:
+    """识别明显没有搜索价值、会浪费上游槽位的输入。"""
+    text = (query or "").strip()
+    if not text:
+        return "empty_query"
+
+    # 只拦截单个 ASCII token 且同一字符重复的退化输入，如 AAA/BBB/111。
+    # 不拦截 AI、EU、xAI、CVE-2026、中文短词或包含空格的真实短查询。
+    if re.fullmatch(r"[A-Za-z0-9]{3,6}", text) and len(set(text.lower())) == 1:
+        return "low_information_query"
+    return None
+
+
+def _query_skip_message(reason: str, query: str) -> str:
+    if reason == "empty_query":
+        return "query 为空，已跳过，未请求上游。"
+    if reason == "low_information_query":
+        return f"query 信息量过低，已跳过以避免占用上游并发槽位: {query!r}"
+    return f"query 已跳过: {reason}"
+
+
 def _build_grok_provider(model: str = "") -> GrokSearchProvider | None:
     try:
         api_url = config.grok_api_url
@@ -269,18 +349,19 @@ def _normalize_target_url(raw_url: str, base_url: str) -> str | None:
     return normalized
 
 
-async def _call_basic_http_fetch(url: str) -> str | None:
+async def _call_basic_http_fetch(url: str, timeout: float = 30.0) -> str | None:
     import httpx
 
+    client_timeout = max(0.1, float(timeout))
     try:
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=client_timeout, follow_redirects=True) as client:
             response = await client.get(url)
             response.raise_for_status()
     except httpx.ConnectError as exc:
         if "CERTIFICATE_VERIFY_FAILED" not in str(exc) and "certificate verify failed" not in str(exc).lower():
             return None
         try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, verify=False) as client:
+            async with httpx.AsyncClient(timeout=client_timeout, follow_redirects=True, verify=False) as client:
                 response = await client.get(url)
                 response.raise_for_status()
         except Exception:
@@ -459,8 +540,42 @@ async def web_search(
     platform: Annotated[str, "Target platform to focus on (e.g., 'Twitter', 'GitHub', 'Reddit'). Leave empty for general web search."] = "",
     model: Annotated[str, "Optional model ID for this request only. This value is used ONLY when user explicitly provided."] = "",
     extra_sources: Annotated[int, "Number of additional reference results from Tavily/Firecrawl. Set 0 to disable. Default 0."] = 0,
+    timeout: Annotated[str, "Optional per-call upstream timeout as a Go-style duration (e.g. '30s', '2m', '500ms'). Empty string or '0s' falls back to the server default GROK_REQUEST_TIMEOUT (currently 120s, env-tunable). Hard ceiling 10m. On timeout the response carries error.code='upstream_timeout' with retryable=true; you can retry the same query with a larger timeout, or fail fast by passing a smaller value."] = "",
 ) -> dict:
+    return await _perform_web_search(
+        query=query,
+        platform=platform,
+        model=model,
+        extra_sources=extra_sources,
+        timeout=timeout,
+    )
+
+
+def _resolve_request_timeout(value) -> float:
+    """根据用户传入的 timeout 字符串解析出最终秒数，空/0 走 server 默认。"""
+    parsed = parse_go_duration(value, max_seconds=600.0)
+    return parsed if parsed > 0 else config.grok_request_timeout
+
+
+async def _perform_web_search(
+    query: str,
+    platform: str = "",
+    model: str = "",
+    extra_sources: int = 0,
+    timeout: str | float = "",
+) -> dict:
+    timeout_seconds = _resolve_request_timeout(timeout)
     session_id = new_session_id()
+    query_text = query.strip() if isinstance(query, str) else ""
+    skip_reason = _classify_query_skip_reason(query_text)
+    if skip_reason:
+        await _SOURCES_CACHE.set(session_id, [])
+        return _build_skipped_search_result(
+            session_id,
+            skip_reason,
+            _query_skip_message(skip_reason, query_text),
+        )
+
     try:
         api_url = config.grok_api_url
         api_key = config.grok_api_key
@@ -504,35 +619,55 @@ async def web_search(
         elif has_tavily:
             tavily_count = extra_sources
 
-    # 并行执行搜索任务
+    # 并行执行搜索任务。
+    #
+    # P0 修复（2026-05-06 stress test 复盘）：
+    # 把 hold_grok_semaphore 放在 asyncio.wait_for **外面**，让 timeout 只覆盖
+    # 真实持锁后的上游时间。早先版本把 wait_for 包在 async with sem 外面，
+    # 当并发量超过 GROK_CONCURRENCY 时，超出的 query 在 Semaphore 排队的时间
+    # 也被算进 timeout，于是后批 query 全部以"upstream_timeout"假阳性失败，
+    # 错误地标 retryable=true 会诱导上层雪崩重试。
+    #
+    # provider 内部用 maybe_acquire_grok_semaphore 配合 _SEM_HELD ContextVar
+    # 检测到外层已持锁后跳过自己的 acquire，避免不可重入 Semaphore 的死锁。
     async def _safe_grok() -> tuple[SearchResponse, dict | None]:
         try:
-            search_response = getattr(grok_provider, "search_response", None)
-            if callable(search_response):
-                return await search_response(query, platform), None
-            raw_content = await grok_provider.search(query, platform)
-            answer, sources = split_answer_and_sources(raw_content or "")
-            return SearchResponse(
-                answer=answer,
-                sources=sources,
-                raw_content=raw_content or "",
-                provider=getattr(grok_provider, "get_provider_name", lambda: provider_mode)(),
-                model=effective_model,
-            ), None
+            async with hold_grok_semaphore():
+                try:
+                    search_response = getattr(grok_provider, "search_response", None)
+                    if callable(search_response):
+                        return await asyncio.wait_for(
+                            search_response(query_text, platform),
+                            timeout=timeout_seconds,
+                        ), None
+                    raw_content = await asyncio.wait_for(
+                        grok_provider.search(query_text, platform),
+                        timeout=timeout_seconds,
+                    )
+                    answer, sources = split_answer_and_sources(raw_content or "")
+                    return SearchResponse(
+                        answer=answer,
+                        sources=sources,
+                        raw_content=raw_content or "",
+                        provider=getattr(grok_provider, "get_provider_name", lambda: provider_mode)(),
+                        model=effective_model,
+                    ), None
+                except asyncio.TimeoutError:
+                    return SearchResponse(provider=provider_mode, model=effective_model), _build_timeout_error(session_id, timeout_seconds)
         except Exception as exc:
             return SearchResponse(provider=provider_mode, model=effective_model), _build_upstream_error(session_id, exc)
 
     async def _safe_tavily() -> list[dict] | None:
         try:
             if tavily_count:
-                return await _call_tavily_search(query, tavily_count)
+                return await _call_tavily_search(query_text, tavily_count)
         except Exception:
             return None
 
     async def _safe_firecrawl() -> list[dict] | None:
         try:
             if firecrawl_count:
-                return await _call_firecrawl_search(query, firecrawl_count)
+                return await _call_firecrawl_search(query_text, firecrawl_count)
         except Exception:
             return None
 
@@ -586,6 +721,355 @@ async def web_search(
     if warning:
         result["warning"] = warning
     return result
+
+
+@mcp.tool(
+    name="web_search_batch",
+    output_schema=None,
+    description="""
+    Performs multiple independent web_search calls concurrently against the upstream Grok provider.
+
+    Use this tool when the planning step (plan_intent / plan_sub_query) produced two or more independent
+    sub-queries that can be executed in parallel. The tool fans out the queries with bounded concurrency
+    (controlled by GROK_CONCURRENCY at the provider level) and returns a list of result objects, each with
+    the same shape as web_search:
+    - session_id: string (use get_sources to retrieve cached sources for that single sub-query)
+    - status: "ok" | "partial" | "empty" | "skipped" | "error"
+    - content: string (Grok answer for that sub-query, may be empty on error/partial)
+    - sources_count: int
+    - model / provider / warning / error: optional fields mirroring web_search
+
+    Concurrency safety: the upstream call rate is bounded by a process-level semaphore shared with web_search,
+    so calling this tool with N queries will never issue more than GROK_CONCURRENCY simultaneous upstream
+    requests. Failures of individual sub-queries are isolated and do not cancel sibling sub-queries.
+
+    Limits:
+    - queries length is capped at 32; extra entries are dropped and a warning is returned.
+    - Empty / whitespace-only and non-string entries are reported in dropped metadata.
+    - Obvious low-information queries return status="skipped" without calling upstream.
+    """,
+    meta={"version": "1.0.0", "author": "guda.studio"},
+)
+async def web_search_batch(
+    queries: Annotated[list[str], "List of independent natural-language search queries to execute concurrently. Each query is processed by the same logic as web_search."],
+    platform: Annotated[str, "Optional shared target platform applied to every query (e.g., 'GitHub', 'Reddit'). Per-query platform is not supported in this tool; call web_search individually if you need it."] = "",
+    model: Annotated[str, "Optional shared model ID applied to every query."] = "",
+    extra_sources: Annotated[int, "Number of additional reference results from Tavily/Firecrawl per query. Set 0 to disable. Default 0."] = 0,
+    timeout: Annotated[str, "Optional per-query upstream timeout as a Go-style duration (e.g. '30s', '2m'). Applied independently to each query in the batch — a single hung upstream cannot stall the rest. Empty/'0s' falls back to GROK_REQUEST_TIMEOUT (currently 120s, env-tunable). Hard ceiling 10m. Timed-out queries return error.code='upstream_timeout' with retryable=true; siblings continue normally."] = "",
+) -> dict:
+    return await _perform_web_search_batch(
+        queries=queries,
+        platform=platform,
+        model=model,
+        extra_sources=extra_sources,
+        timeout=timeout,
+    )
+
+
+async def _perform_web_search_batch(
+    queries: list[str],
+    platform: str = "",
+    model: str = "",
+    extra_sources: int = 0,
+    timeout: str | float = "",
+) -> dict:
+    input_items = list(queries or [])
+    input_size = len(input_items)
+    candidates: list[dict] = []
+    dropped: list[dict] = []
+    for index, item in enumerate(input_items):
+        if not isinstance(item, str):
+            dropped.append({"index": index, "reason": "non_string"})
+            continue
+        text = item.strip()
+        if text:
+            candidates.append({"index": index, "query": text})
+        else:
+            dropped.append({"index": index, "reason": "empty_query"})
+
+    truncated = False
+    if len(candidates) > 32:
+        for item in candidates[32:]:
+            dropped.append({"index": item["index"], "reason": "over_limit"})
+        candidates = candidates[:32]
+        truncated = True
+
+    if not candidates:
+        return {
+            "status": "error",
+            "error": "queries_empty",
+            "message": "queries 必须包含至少一个非空字符串。",
+            "input_size": input_size,
+            "batch_size": 0,
+            "concurrency": config.grok_concurrency,
+            "request_timeout_seconds": _resolve_request_timeout(timeout),
+            "dropped_count": len(dropped),
+            "dropped": dropped,
+            "ok_count": 0,
+            "skipped_count": 0,
+            "error_count": 0,
+            "results": [],
+        }
+
+    coros = [
+        _perform_web_search(
+            query=item["query"],
+            platform=platform,
+            model=model,
+            extra_sources=extra_sources,
+            timeout=timeout,
+        )
+        for item in candidates
+    ]
+    # return_exceptions=True 防御未来某次重构在 _perform_web_search 抛出未捕获异常时
+    # 把整批 gather 带倒；当前实现本身已经把 upstream 异常折叠为 error result。
+    raw_results = await asyncio.gather(*coros, return_exceptions=True)
+    results: list[dict] = []
+    for candidate, item in zip(candidates, raw_results):
+        q = candidate["query"]
+        input_index = candidate["index"]
+        if isinstance(item, dict):
+            result = dict(item)
+        elif isinstance(item, BaseException):
+            result = _build_client_error(
+                new_session_id(),
+                "internal_error",
+                f"web_search 内部异常 (query={q!r}): {type(item).__name__}: {item}",
+                provider="server",
+            )
+        else:
+            result = _build_client_error(
+                new_session_id(),
+                "internal_error",
+                f"web_search 返回类型异常 (query={q!r}): {type(item).__name__}",
+                provider="server",
+            )
+        result.setdefault("input_index", input_index)
+        result.setdefault("query", q)
+        results.append(result)
+
+    ok_count = sum(
+        1 for r in results if isinstance(r, dict) and r.get("status") in ("ok", "partial")
+    )
+    skipped_count = sum(
+        1 for r in results if isinstance(r, dict) and r.get("status") == "skipped"
+    )
+    error_count = sum(
+        1 for r in results if isinstance(r, dict) and r.get("status") == "error"
+    )
+
+    response: dict = {
+        "input_size": input_size,
+        "batch_size": len(candidates),
+        "concurrency": config.grok_concurrency,
+        "request_timeout_seconds": _resolve_request_timeout(timeout),
+        "dropped_count": len(dropped),
+        "dropped": dropped,
+        "ok_count": ok_count,
+        "skipped_count": skipped_count,
+        "error_count": error_count,
+        "results": results,
+    }
+    if truncated:
+        response["warning"] = "queries 数量超过 32 上限，已截断为前 32 条。"
+    return response
+
+
+def _build_task_runner(kind: str, params: dict):
+    """根据 kind 把 params 绑定为一个无参 async 可调用，由 TaskStore 调度。"""
+    timeout_param = params.get("timeout", "") or ""
+    if kind == "web_search":
+        async def _runner():
+            return await _perform_web_search(
+                query=params.get("query", ""),
+                platform=params.get("platform", "") or "",
+                model=params.get("model", "") or "",
+                extra_sources=int(params.get("extra_sources", 0) or 0),
+                timeout=timeout_param,
+            )
+        return _runner
+
+    if kind == "web_search_batch":
+        async def _runner():
+            return await _perform_web_search_batch(
+                queries=params.get("queries") or [],
+                platform=params.get("platform", "") or "",
+                model=params.get("model", "") or "",
+                extra_sources=int(params.get("extra_sources", 0) or 0),
+                timeout=timeout_param,
+            )
+        return _runner
+
+    raise ValueError(f"unsupported task kind: {kind!r}")
+
+
+@mcp.tool(
+    name="submit_search_task",
+    output_schema=None,
+    description="""
+    Submit a web_search or web_search_batch task for asynchronous background execution.
+
+    Returns task_id immediately so the caller can keep working (planning, writing code,
+    invoking other tools) while the search runs upstream. Poll the result with
+    get_search_task_result(task_id) — pass wait="30s" for long-polling, or wait="0s"
+    (default) for an instant snapshot.
+
+    Use this when:
+    - You expect the search to take more than ~5 seconds and you have other independent
+      work to do during the wait.
+    - You want to fire several searches and collect them out of order as they finish.
+
+    For one-shot synchronous calls keep using web_search or web_search_batch.
+
+    Concurrency: backgrounded tasks still go through the same provider Semaphore as
+    the synchronous tools, so total upstream concurrency stays bounded by
+    GROK_CONCURRENCY regardless of how many tasks are submitted.
+    """,
+    meta={"version": "1.0.0", "author": "guda.studio"},
+)
+async def submit_search_task(
+    kind: Annotated[str, "Task kind: 'web_search' or 'web_search_batch'."],
+    params: Annotated[dict, "Same field set as the corresponding sync tool. For 'web_search': query (required), platform, model, extra_sources, timeout. For 'web_search_batch': queries (required, list[str]), platform, model, extra_sources, timeout. The 'timeout' field is a Go-style duration string; empty/'0s' falls back to GROK_REQUEST_TIMEOUT."],
+) -> dict:
+    if kind not in _TASK_VALID_KINDS:
+        return {
+            "status": "error",
+            "error": "invalid_kind",
+            "message": f"kind 必须是 {sorted(_TASK_VALID_KINDS)} 之一，收到 {kind!r}。",
+        }
+    if not isinstance(params, dict):
+        return {
+            "status": "error",
+            "error": "invalid_params",
+            "message": "params 必须是一个对象/字典。",
+        }
+    if kind == "web_search":
+        query = params.get("query")
+        if not isinstance(query, str) or not query.strip():
+            return {
+                "status": "error",
+                "error": "invalid_params",
+                "message": "kind=web_search 时 params.query 必须是非空字符串。",
+            }
+    elif kind == "web_search_batch":
+        queries = params.get("queries")
+        if not isinstance(queries, list) or not any(isinstance(q, str) and q.strip() for q in queries):
+            return {
+                "status": "error",
+                "error": "invalid_params",
+                "message": "kind=web_search_batch 时 params.queries 必须是包含至少一个非空字符串的数组。",
+            }
+
+    runner = _build_task_runner(kind, params)
+    record = await get_task_store().submit(kind=kind, params=params, runner=runner)
+    return record.to_public_dict()
+
+
+@mcp.tool(
+    name="get_search_task_result",
+    output_schema=None,
+    description="""
+    Read a search task's current state and result.
+
+    Pass wait="30s" (or any Go-style duration up to 5m) to long-poll until the task
+    reaches a terminal state (completed/failed/cancelled). wait="0s" (the default)
+    returns the current snapshot immediately without blocking.
+
+    The returned object always includes task_id / kind / state / submitted_at /
+    started_at / finished_at / params, plus 'result' once completed and 'error' on
+    failure. The shape of 'result' matches the corresponding synchronous tool.
+    """,
+    meta={"version": "1.0.0", "author": "guda.studio"},
+)
+async def get_search_task_result(
+    task_id: Annotated[str, "Task ID returned from submit_search_task."],
+    wait: Annotated[str, "Optional Go-style duration (e.g. '0s', '30s', '2m'). Maximum 5m. Default '0s'. When >0 the call blocks until the task is terminal or the deadline elapses."] = "0s",
+) -> dict:
+    seconds = parse_go_duration(wait)
+    record = await get_task_store().get(task_id, wait_seconds=seconds)
+    if record is None:
+        return {
+            "status": "error",
+            "error": "task_not_found",
+            "task_id": task_id,
+            "message": "task_id 不存在或已被淘汰。",
+        }
+    return record.to_public_dict()
+
+
+@mcp.tool(
+    name="cancel_search_task",
+    output_schema=None,
+    description="""
+    Cancel a queued or running search task. Already-terminal tasks return their
+    current snapshot unchanged.
+
+    Cancellation closes the in-flight HTTP connection to the upstream provider via
+    asyncio.Task.cancel(), so the GROK_CONCURRENCY slot is released immediately —
+    use this to abandon work the caller no longer needs.
+    """,
+    meta={"version": "1.0.0", "author": "guda.studio"},
+)
+async def cancel_search_task(
+    task_id: Annotated[str, "Task ID returned from submit_search_task."],
+    hint: Annotated[str, "Optional cancellation reason (e.g. 'user', 'timeout'). Stored verbatim on the task record. Default 'client'."] = "client",
+) -> dict:
+    record = await get_task_store().cancel(task_id, hint=hint or "client")
+    if record is None:
+        return {
+            "status": "error",
+            "error": "task_not_found",
+            "task_id": task_id,
+            "message": "task_id 不存在或已被淘汰。",
+        }
+    return record.to_public_dict()
+
+
+@mcp.tool(
+    name="list_search_tasks",
+    output_schema=None,
+    description="""
+    List submitted search tasks, sorted by submitted_at ascending.
+
+    Optional filters:
+    - states: list of state strings, any of queued/running/completed/failed/cancelled
+    - kinds: list of kind strings, any of web_search/web_search_batch
+    - since: RFC3339 timestamp; only tasks submitted at or after this point are returned
+
+    The list is bounded to the most recent 256 tasks per server process; older
+    terminal tasks are evicted in LRU order to make room for new submissions.
+    """,
+    meta={"version": "1.0.0", "author": "guda.studio"},
+)
+async def list_search_tasks(
+    states: Annotated[list[str], "Optional filter on task state. Any of queued/running/completed/failed/cancelled."] = [],
+    kinds: Annotated[list[str], "Optional filter on task kind. Any of web_search/web_search_batch."] = [],
+    since: Annotated[str, "Optional RFC3339 timestamp; only tasks submitted at or after this point are returned. Empty string disables the filter."] = "",
+) -> dict:
+    since_ts: float | None = None
+    if since:
+        try:
+            import datetime as _dt
+            normalized = since.strip()
+            if normalized.endswith("Z"):
+                normalized = normalized[:-1] + "+00:00"
+            since_ts = _dt.datetime.fromisoformat(normalized).timestamp()
+        except Exception:
+            return {
+                "status": "error",
+                "error": "invalid_since",
+                "message": f"since 不是合法的 RFC3339 时间戳：{since!r}",
+            }
+
+    records = await get_task_store().list_tasks(
+        states=list(states) if states else None,
+        kinds=list(kinds) if kinds else None,
+        since=since_ts,
+    )
+    return {
+        "count": len(records),
+        "tasks": [r.to_public_dict() for r in records],
+    }
 
 
 @mcp.tool(
@@ -734,18 +1218,38 @@ async def _call_firecrawl_scrape(url: str, ctx=None) -> str | None:
 )
 async def web_fetch(
     url: Annotated[str, "Valid HTTP/HTTPS web address pointing to the target page. Must be complete and accessible."],
+    timeout: Annotated[str, "Optional total fetch timeout as a Go-style duration (e.g. '30s', '2m', '500ms'). Empty string or '0s' falls back to GROK_REQUEST_TIMEOUT. The timeout covers fallback extraction steps and prevents waiting forever for an upstream concurrency slot."] = "",
     ctx: Context = None
 ) -> str:
     await log_info(ctx, f"Begin Fetch: {url}", config.debug_enabled)
+    timeout_seconds = _resolve_request_timeout(timeout)
+    deadline = time.perf_counter() + timeout_seconds
+
+    def timeout_message() -> str:
+        return f"提取超时: web_fetch 在 {timeout_seconds:.1f}s 内未完成。"
+
+    async def with_fetch_budget(factory):
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            raise asyncio.TimeoutError
+        return await asyncio.wait_for(factory(), timeout=remaining)
 
     if config.tavily_enabled:
-        result = await _call_tavily_extract(url)
+        try:
+            result = await with_fetch_budget(lambda: _call_tavily_extract(url))
+        except asyncio.TimeoutError:
+            await log_info(ctx, timeout_message(), config.debug_enabled)
+            return timeout_message()
         if result:
             await log_info(ctx, "Fetch Finished (Tavily)!", config.debug_enabled)
             return result
 
     await log_info(ctx, "Tavily unavailable or failed, trying Firecrawl...", config.debug_enabled)
-    result = await _call_firecrawl_scrape(url, ctx)
+    try:
+        result = await with_fetch_budget(lambda: _call_firecrawl_scrape(url, ctx))
+    except asyncio.TimeoutError:
+        await log_info(ctx, timeout_message(), config.debug_enabled)
+        return timeout_message()
     if result:
         await log_info(ctx, "Fetch Finished (Firecrawl)!", config.debug_enabled)
         return result
@@ -754,15 +1258,31 @@ async def web_fetch(
     grok_provider = _build_grok_provider()
     if grok_provider:
         try:
-            result = await grok_provider.fetch(url, ctx)
+            async def grok_fetch_with_slot():
+                async with hold_grok_semaphore():
+                    return await grok_provider.fetch(url, ctx)
+
+            result = await with_fetch_budget(grok_fetch_with_slot)
             if result and result.strip():
                 await log_info(ctx, "Fetch Finished (Grok)!", config.debug_enabled)
                 return result
+        except asyncio.TimeoutError:
+            await log_info(ctx, timeout_message(), config.debug_enabled)
+            return timeout_message()
         except Exception as exc:
             await log_info(ctx, f"Grok fetch failed: {exc}", config.debug_enabled)
 
     await log_info(ctx, "Grok fetch unavailable, trying raw HTTP fallback...", config.debug_enabled)
-    result = await _call_basic_http_fetch(url)
+    try:
+        result = await with_fetch_budget(
+            lambda: _call_basic_http_fetch(
+                url,
+                timeout=max(0.1, deadline - time.perf_counter()),
+            )
+        )
+    except asyncio.TimeoutError:
+        await log_info(ctx, timeout_message(), config.debug_enabled)
+        return timeout_message()
     if result:
         await log_info(ctx, "Fetch Finished (basic HTTP)!", config.debug_enabled)
         return result
@@ -864,12 +1384,32 @@ async def get_config_info() -> str:
     import httpx
 
     config_info = config.get_config_info()
+    started_at = time.perf_counter()
+    models_url = ""
+
+    def record_elapsed() -> None:
+        test_result["response_time_ms"] = round((time.perf_counter() - started_at) * 1000, 2)
+
+    def exception_detail(exc: Exception) -> str:
+        message = str(exc).strip()
+        if message:
+            return message
+
+        try:
+            request = exc.request
+        except (AttributeError, RuntimeError):
+            request = None
+        if request is not None:
+            return f"{type(exc).__name__}: <empty message> ({request.method} {request.url})"
+        if models_url:
+            return f"{type(exc).__name__}: <empty message> ({models_url})"
+        return f"{type(exc).__name__}: <empty message>"
 
     # 添加连接测试
     test_result = {
         "status": "未测试",
         "message": "",
-        "response_time_ms": 0
+        "response_time_ms": 0,
     }
 
     try:
@@ -878,11 +1418,9 @@ async def get_config_info() -> str:
 
         # 构建 /models 端点 URL
         models_url = f"{api_url.rstrip('/')}/models"
+        test_result["models_url"] = models_url
 
         # 发送测试请求
-        import time
-        start_time = time.time()
-
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(
                 models_url,
@@ -892,7 +1430,7 @@ async def get_config_info() -> str:
                 }
             )
 
-            response_time = (time.time() - start_time) * 1000  # 转换为毫秒
+            response_time = (time.perf_counter() - started_at) * 1000  # 转换为毫秒
 
             if response.status_code == 200:
                 test_result["status"] = "✅ 连接成功"
@@ -921,18 +1459,22 @@ async def get_config_info() -> str:
                 test_result["message"] = f"HTTP {response.status_code}: {response.text[:100]}"
                 test_result["response_time_ms"] = round(response_time, 2)
 
-    except httpx.TimeoutException:
+    except httpx.TimeoutException as e:
+        record_elapsed()
         test_result["status"] = "❌ 连接超时"
-        test_result["message"] = "请求超时（10秒），请检查网络连接或 API URL"
+        test_result["message"] = f"请求超时（10秒），请检查网络连接或 API URL: {exception_detail(e)}"
     except httpx.RequestError as e:
+        record_elapsed()
         test_result["status"] = "❌ 连接失败"
-        test_result["message"] = f"网络错误: {str(e)}"
+        test_result["message"] = f"网络错误: {exception_detail(e)}"
     except ValueError as e:
+        record_elapsed()
         test_result["status"] = "❌ 配置错误"
         test_result["message"] = str(e)
     except Exception as e:
+        record_elapsed()
         test_result["status"] = "❌ 测试失败"
-        test_result["message"] = f"未知错误: {str(e)}"
+        test_result["message"] = f"未知错误: {exception_detail(e)}"
 
     config_info["connection_test"] = test_result
 

@@ -1,3 +1,5 @@
+import json
+
 import httpx
 import pytest
 
@@ -151,3 +153,31 @@ async def test_web_search_surfaces_sse_upstream_status(monkeypatch):
     assert result["error"]["code"] == "upstream_error"
     assert result["error"]["upstream_status"] == 403
     assert "流式错误" in result["content"]
+
+
+@pytest.mark.asyncio
+async def test_get_config_info_reports_empty_request_error(monkeypatch):
+    class EmptyRequestErrorClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, *args, **kwargs):
+            raise httpx.RequestError("")
+
+    monkeypatch.setenv("GROK_API_URL", "https://example.test/v1")
+    monkeypatch.setenv("GROK_API_KEY", "bad-key")
+    monkeypatch.setattr(httpx, "AsyncClient", EmptyRequestErrorClient)
+
+    payload = json.loads(await server.get_config_info())
+    connection_test = payload["connection_test"]
+
+    assert connection_test["status"] == "❌ 连接失败"
+    assert connection_test["models_url"] == "https://example.test/v1/models"
+    assert "网络错误: RequestError: <empty message>" in connection_test["message"]
+    assert connection_test["response_time_ms"] >= 0
