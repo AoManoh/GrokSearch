@@ -198,6 +198,8 @@ claude mcp add-json grok-search --scope user '{
 | `GROK_RETRY_MAX_ATTEMPTS` | ❌ | `3` | 最大重试次数 |
 | `GROK_RETRY_MULTIPLIER` | ❌ | `1` | 重试退避乘数 |
 | `GROK_RETRY_MAX_WAIT` | ❌ | `10` | 重试最大等待秒数 |
+| `GROK_CONCURRENCY` | ❌ | `4` | 上游 grok2api 并发上限（chat 与 responses 共享 Semaphore），范围 1-32 |
+| `GROK_REQUEST_TIMEOUT` | ❌ | `120` | 单次搜索/抓取请求的总时长上限（秒），server 默认值。AI 可在调用 `web_search` / `web_search_batch` / `web_fetch` / `submit_search_task` 时传 `timeout` 参数覆盖。范围 [5, 600] |
 | `HTTP_PROXY` | ❌ | - | HTTP 出站代理（例如 `http://127.0.0.1:7890`） |
 | `HTTPS_PROXY` | ❌ | - | HTTPS 出站代理（例如 `http://127.0.0.1:7890`） |
 | `ALL_PROXY` | ❌ | - | 全协议出站代理 |
@@ -237,7 +239,7 @@ claude mcp list
 ## 三、MCP 工具介绍
 
 <details>
-<summary>本项目提供八个 MCP 工具（展开查看）</summary>
+<summary>本项目提供十三个 MCP 工具（展开查看）</summary>
 
 ### `web_search` — AI 网络搜索
 
@@ -251,6 +253,7 @@ claude mcp list
 | `platform` | string | ❌ | `""` | 聚焦平台（如 `"Twitter"`, `"GitHub, Reddit"`） |
 | `model` | string | ❌ | `null` | 按次指定 Grok 模型 ID |
 | `extra_sources` | int | ❌ | `0` | 额外补充信源数量（Tavily/Firecrawl，可为 0 关闭） |
+| `timeout` | string | ❌ | `""` | Go 风格 duration（`"30s"` / `"2m"` / `"500ms"`），单次上游请求总时长上限。空/`"0s"` 走 `GROK_REQUEST_TIMEOUT` 默认。超时返回 `error.code="upstream_timeout"`（`retryable=true`），可放大 timeout 重试 |
 
 自动检测查询中的时间相关关键词（如"最新""今天""recent"等），注入本地时间上下文以提升时效性搜索的准确度。
 
@@ -260,6 +263,71 @@ claude mcp list
 - `content`: Grok 回答正文（已自动剥离信源）
 - `sources_count`: 已缓存的信源数量
 - `error`: 仅失败时返回，包含 `code` / `message` / `provider` / `upstream_status`
+
+### `web_search_batch` — 并发批量搜索
+
+面向规划链路输出多个独立子查询的场景，对 N 条 query 并发调用 `web_search` 的核心逻辑，受 `GROK_CONCURRENCY` 进程级 Semaphore 限流，单条失败相互隔离。
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `queries` | string[] | ✅ | - | 待并发执行的查询列表，最多 32 条；非字符串、空白和超限输入不执行并记录在 `dropped` 中 |
+| `platform` | string | ❌ | `""` | 共享聚焦平台（如 `"GitHub"`），所有 query 共用，不支持逐条覆盖 |
+| `model` | string | ❌ | `""` | 共享模型 ID |
+| `extra_sources` | int | ❌ | `0` | 每条 query 的 Tavily/Firecrawl 补充信源数 |
+| `timeout` | string | ❌ | `""` | 每条 query 独立的 Go 风格 duration 超时，超时只折叠该条为 `upstream_timeout` 不影响其余。空/`"0s"` 走 `GROK_REQUEST_TIMEOUT` 默认 |
+
+返回值（结构化字典）：
+- `input_size`: 调用方提交的原始输入数量
+- `batch_size`: 实际进入搜索流程的 query 数量（裁剪空白、非字符串与超限输入后）
+- `concurrency`: 当前 `GROK_CONCURRENCY` 上限
+- `request_timeout_seconds`: 本次每条 query 实际生效的总时长上限
+- `dropped_count` / `dropped`: 未进入搜索流程的输入回执，每项包含原始 `index` 和 `reason`
+- `ok_count` / `skipped_count` / `error_count`: 成功、主动跳过与失败计数
+- `results`: 与 `web_search` 输出同构的列表，每项独立带 `session_id`、`input_index`、`query`，可分别用 `get_sources` 拉取信源
+- `warning`: 仅在 query 数量被截断到 32 时返回
+
+`AAA`、`BBB`、`111` 这类单 token 重复字符输入会以 `status="skipped"` 返回，不请求上游，也不占用 Grok 并发槽位。`AI`、`xAI`、`EU AI Act`、`AA` 等有效短查询不会被拦截。
+
+### `submit_search_task` — 提交后台搜索任务
+
+向后台提交 `web_search` 或 `web_search_batch` 并立即返回 `task_id`，调用方可以在后台跑的同时继续计划、写代码、调别的工具。后续用 `get_search_task_result` 拉取结果。
+
+与同步工具共享同一个 `GROK_CONCURRENCY` Semaphore，提交多个任务不会双倍打穿上游。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `kind` | string | ✅ | `web_search` 或 `web_search_batch` |
+| `params` | dict | ✅ | 与同名同步工具一致的参数集，包括 `timeout`。`web_search` 需 `query`；`web_search_batch` 需 `queries: list[str]`；都可选 `timeout` 字符串覆盖 server 默认 |
+
+返回值：`task_id` / `kind` / `state` / `submitted_at` / `params` 等字段的任务快照。
+
+### `get_search_task_result` — 读取任务状态与结果
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `task_id` | string | ✅ | - | `submit_search_task` 返回的 `task_id` |
+| `wait` | string | ❌ | `"0s"` | Go 风格 duration（如 `"30s"` / `"2m"` / `"500ms"`），封顶 5 分钟。`"0s"` 表示立即读快照，>0 会 long-poll 到任务达到 terminal 状态或超时返回 |
+
+返回任务快照，状态为以下之一：`queued` / `running` / `completed` / `failed` / `cancelled`。`state == "completed"` 时一定带 `result` 字段，其结构与对应同步工具一致。
+
+### `cancel_search_task` — 取消任务
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `task_id` | string | ✅ | - | 待取消的 `task_id` |
+| `hint` | string | ❌ | `"client"` | 取消原因记录到任务上 |
+
+取消运行中任务会调 `asyncio.Task.cancel()` 中断上游 HTTP 连接，立即释放 `GROK_CONCURRENCY` 名额。已终态的任务返回当前快照不变。
+
+### `list_search_tasks` — 列出任务
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `states` | string[] | ❌ | `[]` | 状态过滤，允许 queued/running/completed/failed/cancelled |
+| `kinds` | string[] | ❌ | `[]` | 任务类型过滤，允许 web_search/web_search_batch |
+| `since` | string | ❌ | `""` | RFC3339 时间戳，仅返回该时间后提交的任务；空字符串不过滤 |
+
+返回 `count` 与 `tasks` 列表，按 `submitted_at` 升序。全局任务表上限 256 条，超出后优先淘汰 terminal 任务。
 
 ### `get_sources` — 获取信源
 
@@ -276,11 +344,12 @@ claude mcp list
 
 ### `web_fetch` — 网页内容抓取
 
-通过 Tavily Extract API 获取完整网页内容，返回 Markdown 格式。Tavily 失败时自动降级到 Firecrawl Scrape 进行托底抓取。
+通过 Tavily Extract API 获取完整网页内容，返回 Markdown 格式。Tavily 失败时自动降级到 Firecrawl Scrape、Grok fetch 和基础 HTTP 托底抓取。
 
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `url` | string | ✅ | 目标网页 URL |
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `url` | string | ✅ | - | 目标网页 URL |
+| `timeout` | string | ❌ | `""` | Go 风格 duration（`"30s"` / `"2m"` / `"500ms"`）。空/`"0s"` 走 `GROK_REQUEST_TIMEOUT` 默认，覆盖 Tavily、Firecrawl、Grok fetch 及基础 HTTP fallback 的总等待时间 |
 
 ### `web_map` — 站点结构映射
 
@@ -297,7 +366,7 @@ claude mcp list
 
 ### `get_config_info` — 配置诊断
 
-无需参数。显示所有配置状态、测试 Grok API 连接、返回响应时间和可用模型列表（API Key 自动脱敏）。
+无需参数。显示所有配置状态、测试 Grok API 连接、返回响应时间、测试 URL 和可用模型列表（API Key 自动脱敏）。网络异常会带异常类型，避免出现空的 `网络错误:` 文案。
 
 ### `switch_model` — 模型切换
 
@@ -320,7 +389,53 @@ claude mcp list
 结构化搜索规划脚手架（分阶段、多轮），用于在执行复杂搜索前先生成可执行的搜索计划。
 </details>
 
-## 四、常见问题
+## 四、Claude Skills 包
+
+仓库 `skills/` 目录提供了一份 [Anthropic Claude Skills](https://platform.claude.com/docs/en/agents-and-tools/agent-skills) 兼容的技能包，用于让支持 Claude Skills 的 Agent 直接学会使用本项目的能力。脚本读取环境变量、不依赖 `grok-search` MCP 进程，可作为 MCP 工具的独立等价物使用。
+
+每个 skill 是一个独立目录，包含 `SKILL.md`（YAML frontmatter + 使用说明），部分还带 `scripts/`、`references/` 子目录。
+
+| Skill | 用途 | 入口脚本 | 必要环境变量 |
+|---|---|---|---|
+| `grok-web-search` | Grok AI 网页搜索 + 信源（OpenAI 兼容 `/chat/completions` 或 xAI `/responses`），可选 Tavily / Firecrawl 补充信源 | `scripts/web_search.py` | `GROK_API_URL`, `GROK_API_KEY`（可选 `GROK_MODEL` / `TAVILY_API_KEY` / `FIRECRAWL_API_KEY`） |
+| `tavily-web-fetch` | 单 URL 转 Markdown，Tavily Extract 主路径，Firecrawl Scrape 自动降级 | `scripts/web_fetch.py` | 至少一个：`TAVILY_API_KEY` 或 `FIRECRAWL_API_KEY` |
+| `tavily-web-map` | 站点结构映射 | `scripts/web_map.py` | `TAVILY_API_KEY` |
+| `search-planning` | 多步研究规划方法论（6 阶段：意图 → 复杂度 → 子查询 → 搜索词 → 工具映射 → 执行顺序），无脚本，纯流程参考 | — | — |
+
+### 在 Claude Skills 客户端中加载
+
+```bash
+git clone https://github.com/AoManoh/GrokSearch.git
+# 把需要的 skill 整目录复制到客户端 skills 路径下
+cp -r GrokSearch/skills/grok-web-search ~/.claude/skills/
+cp -r GrokSearch/skills/search-planning ~/.claude/skills/
+```
+
+具体安装路径请以 Claude / Claude Code 当时文档为准。
+
+### 直接命令行调用
+
+```bash
+GROK_API_URL=https://your-grok2api-host/v1 \
+GROK_API_KEY=your-key \
+python GrokSearch/skills/grok-web-search/scripts/web_search.py \
+  --query "FastAPI 0.121 release notes" --json
+```
+
+每个脚本支持 `--help`；纯函数回归测试见 `skills/grok-web-search/scripts/test_web_search.py`。
+
+### 与 MCP 工具的关系
+
+| 维度 | MCP 工具 | Claude Skills |
+|---|---|---|
+| 形态 | 长驻 stdio / HTTP 服务 | 文件 + 脚本，按需加载 |
+| 触发 | LLM 工具调用 | LLM 读 `SKILL.md` frontmatter 自激活 |
+| 部署 | `claude mcp add ...` | `cp -r skills/<name> ~/.claude/skills/` |
+| 数据源 | `src/grok_search/` | `skills/*/scripts/` 是 `src/grok_search/` 的 hand-maintained 镜像 |
+
+两者覆盖场景互补，可同时启用。脚本与 MCP 实现的一致性由维护者手动同步，发生功能差异时以 MCP server 为准。
+
+## 五、常见问题
 
 <details>
 <summary>
