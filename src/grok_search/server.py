@@ -103,7 +103,13 @@ async def _get_available_models_cached(api_url: str, api_key: str) -> list[str]:
     try:
         models = await _fetch_available_models(api_url, api_key)
     except Exception:
-        models = []
+        # 上游临时故障：返回空列表让 effective_model fallback 走默认值，
+        # 但**不写入缓存**，下一次调用仍会重新拉取，避免 5 分钟假阳性窗口。
+        return []
+
+    if not models:
+        # 上游 200 但 data=[]（grok2api 启动瞬间 / 鉴权降级 / 空配置）：
+        # 同样不缓存，避免一次抖动污染整整 5 分钟内所有 query 的模型选择。
         return models
 
     async with _AVAILABLE_MODELS_LOCK:

@@ -106,6 +106,36 @@ async def test_model_cache_does_not_cache_failures(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_model_cache_does_not_cache_empty_success(monkeypatch):
+    """上游 200 但 data=[] 时不应污染 5 分钟缓存窗口。"""
+    attempts = 0
+
+    async def fake_fetch(api_url: str, api_key: str) -> list[str]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return []  # 上游瞬时返回空列表（启动中 / 鉴权降级）
+        return ["grok-4.1-fast", "grok-4.20-fast"]
+
+    async with server._AVAILABLE_MODELS_LOCK:
+        server._AVAILABLE_MODELS_CACHE.clear()
+
+    monkeypatch.setattr(server, "_fetch_available_models", fake_fetch)
+
+    first = await server._get_available_models_cached("https://example.test/v1", "k")
+    second = await server._get_available_models_cached("https://example.test/v1", "k")
+
+    assert first == []
+    assert second == ["grok-4.1-fast", "grok-4.20-fast"], "空成功响应不应被缓存"
+    assert attempts == 2
+
+    async with server._AVAILABLE_MODELS_LOCK:
+        assert ("https://example.test/v1", "k") in server._AVAILABLE_MODELS_CACHE, (
+            "非空响应应当被缓存"
+        )
+
+
+@pytest.mark.asyncio
 async def test_parse_streaming_response_raises_on_sse_error():
     provider = GrokSearchProvider("https://example.test/v1", "key")
 
