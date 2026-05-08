@@ -183,6 +183,25 @@ class Config:
         return os.getenv("GROK_LOG_LEVEL", "INFO").upper()
 
     @property
+    def task_store_path(self) -> Path | None:
+        """任务存储 JSONL 落盘路径。
+
+        - 空字符串 / 未设置：纯内存模式，重启丢失（默认行为，向后兼容）
+        - 绝对路径：直接使用
+        - 相对路径：解析为 ``Path.cwd() / value``
+
+        路径目录在 TaskStore 启动 replay 时按需创建；磁盘 IO 失败不会阻断
+        任务执行，只会日志告警 + 自动降级回纯内存模式。
+        """
+        value = (os.getenv("GROK_TASK_STORE_PATH") or "").strip()
+        if not value:
+            return None
+        path = Path(value)
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        return path
+
+    @property
     def log_dir(self) -> Path:
         log_dir_str = os.getenv("GROK_LOG_DIR", "logs")
         log_dir = Path(log_dir_str)

@@ -5,7 +5,10 @@
 
 设计要点：
 
-- 单进程内存版，使用 ``OrderedDict`` 维护 LRU 顺序；不做磁盘持久化。
+- 单进程内存版，使用 ``OrderedDict`` 维护 LRU 顺序。
+- 可选 JSONL 落盘持久化：``GROK_TASK_STORE_PATH`` 非空时启用，启动时 replay
+  历史任务（terminal 状态原样恢复，进行中状态标记为 ``failed`` +
+  ``error="lost on restart"``）。
 - 256 条软上限：超出时优先淘汰已 terminal 的任务，保留进行中的任务。
 - 状态机：``queued -> running -> completed | failed | cancelled``。
 - 实际搜索仍走原同步路径（``_perform_web_search`` 等），底层并发受
@@ -19,12 +22,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import re
 import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+
+_log = logging.getLogger(__name__)
 
 
 _DURATION_PATTERN = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(ms|s|m|h)?\s*$", re.IGNORECASE)
@@ -130,12 +138,133 @@ class TaskRecord:
 
 
 class TaskStore:
-    """进程级异步搜索任务存储。"""
+    """进程级异步搜索任务存储。
 
-    def __init__(self, max_tasks: int = _MAX_TASKS):
+    可选 JSONL 落盘持久化：传入 ``storage_path`` 时启用，事件按以下 schema 追加：
+
+    - ``{"event": "submit", "task_id", "kind", "params", "submitted_at"}``
+    - ``{"event": "start", "task_id", "started_at"}``
+    - ``{"event": "complete", "task_id", "finished_at", "result"}``
+    - ``{"event": "fail", "task_id", "finished_at", "error"}``
+    - ``{"event": "cancel", "task_id", "finished_at", "cancel_hint"}``
+
+    磁盘 IO 失败一律降级为 warning 日志，不影响任务执行。
+    """
+
+    def __init__(self, max_tasks: int = _MAX_TASKS, storage_path: Path | None = None):
         self._max_tasks = max_tasks
         self._lock = asyncio.Lock()
         self._records: OrderedDict[str, TaskRecord] = OrderedDict()
+        self._storage_path = storage_path
+        self._persistence_disabled = False
+        if storage_path is not None:
+            self._init_persistence()
+
+    def _init_persistence(self) -> None:
+        """启动时准备目录 + replay 已有 JSONL。
+
+        replay 失败（损坏 / 权限）只会清空内存视图后退化为纯内存模式，不抛异常。
+        """
+        path = self._storage_path
+        assert path is not None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            _log.warning("task_store: 创建持久化目录失败，降级为纯内存模式: %s", exc)
+            self._persistence_disabled = True
+            return
+        if not path.exists():
+            return
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                lines = list(f)
+        except OSError as exc:
+            _log.warning("task_store: 读取 %s 失败，降级为纯内存模式: %s", path, exc)
+            self._persistence_disabled = True
+            return
+        replayed = self._replay_events(lines)
+        for record in replayed.values():
+            self._records[record.task_id] = record
+        if replayed:
+            _log.info("task_store: replay %d 条历史任务（%s）", len(replayed), path)
+
+    @staticmethod
+    def _replay_events(lines: list[str]) -> "OrderedDict[str, TaskRecord]":
+        """把 JSONL 行序列重放成 task_id -> TaskRecord 字典。
+
+        进程崩溃后未到达 terminal 的任务（仅有 submit / start 事件）会被标记为
+        ``failed`` + ``error="lost on restart"``，由调用方根据 task_id 重新提交。
+        """
+        records: OrderedDict[str, TaskRecord] = OrderedDict()
+        for raw in lines:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                _log.warning("task_store: 跳过损坏行: %r", line[:120])
+                continue
+            etype = event.get("event")
+            tid = event.get("task_id")
+            if not isinstance(tid, str) or not tid:
+                continue
+            if etype == "submit":
+                rec = TaskRecord(
+                    task_id=tid,
+                    kind=event.get("kind", ""),
+                    params=event.get("params") or {},
+                    state=TASK_STATE_QUEUED,
+                    submitted_at=float(event.get("submitted_at") or time.time()),
+                )
+                records[tid] = rec
+                continue
+            rec = records.get(tid)
+            if rec is None:
+                continue
+            if etype == "start":
+                rec.state = TASK_STATE_RUNNING
+                rec.started_at = float(event.get("started_at") or time.time())
+            elif etype == "complete":
+                rec.state = TASK_STATE_COMPLETED
+                rec.finished_at = float(event.get("finished_at") or time.time())
+                rec.result = event.get("result") if isinstance(event.get("result"), dict) else None
+                rec._done_event.set()
+            elif etype == "fail":
+                rec.state = TASK_STATE_FAILED
+                rec.finished_at = float(event.get("finished_at") or time.time())
+                rec.error = event.get("error")
+                rec._done_event.set()
+            elif etype == "cancel":
+                rec.state = TASK_STATE_CANCELLED
+                rec.finished_at = float(event.get("finished_at") or time.time())
+                rec.cancel_hint = event.get("cancel_hint") or "cancelled"
+                rec._done_event.set()
+        # 把进程崩溃时仍 in-flight 的任务转为 failed，避免轮询者永远等不到终态
+        for rec in records.values():
+            if not rec.is_terminal:
+                rec.state = TASK_STATE_FAILED
+                rec.error = "lost on restart"
+                rec.finished_at = time.time()
+                rec._done_event.set()
+        return records
+
+    def _append_event(self, event: dict[str, Any]) -> None:
+        """同步追加一行 JSONL；失败仅 warning 日志，不抛。
+
+        同步写入而非 fire-and-forget：状态变化频率不高（每个任务最多 3 行），
+        本地磁盘单次 write 通常 < 1ms，比起异步 queue + 后台 task 的复杂度
+        和潜在丢数据风险，同步写更简单可控。
+        """
+        if self._storage_path is None or self._persistence_disabled:
+            return
+        try:
+            with self._storage_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            _log.warning("task_store: 写入 %s 失败，降级为纯内存模式: %s",
+                         self._storage_path, exc)
+            self._persistence_disabled = True
 
     async def submit(
         self,
@@ -160,10 +289,22 @@ class TaskStore:
             self._records[record.task_id] = record
             self._records.move_to_end(record.task_id)
             self._evict_locked()
+        self._append_event({
+            "event": "submit",
+            "task_id": record.task_id,
+            "kind": record.kind,
+            "params": record.params,
+            "submitted_at": record.submitted_at,
+        })
 
         async def _wrapper():
             record.started_at = time.time()
             record.state = TASK_STATE_RUNNING
+            self._append_event({
+                "event": "start",
+                "task_id": record.task_id,
+                "started_at": record.started_at,
+            })
             try:
                 result = await runner()
             except asyncio.CancelledError:
@@ -171,18 +312,36 @@ class TaskStore:
                 record.finished_at = time.time()
                 if not record.cancel_hint:
                     record.cancel_hint = "cancelled"
+                self._append_event({
+                    "event": "cancel",
+                    "task_id": record.task_id,
+                    "finished_at": record.finished_at,
+                    "cancel_hint": record.cancel_hint,
+                })
                 record._done_event.set()
                 raise
             except Exception as exc:
                 record.state = TASK_STATE_FAILED
                 record.error = f"{type(exc).__name__}: {exc}"
                 record.finished_at = time.time()
+                self._append_event({
+                    "event": "fail",
+                    "task_id": record.task_id,
+                    "finished_at": record.finished_at,
+                    "error": record.error,
+                })
                 record._done_event.set()
                 return
             else:
                 record.state = TASK_STATE_COMPLETED
                 record.result = result if isinstance(result, dict) else {"value": result}
                 record.finished_at = time.time()
+                self._append_event({
+                    "event": "complete",
+                    "task_id": record.task_id,
+                    "finished_at": record.finished_at,
+                    "result": record.result,
+                })
                 record._done_event.set()
 
         record._asyncio_task = asyncio.create_task(_wrapper(), name=record.task_id)
@@ -218,11 +377,23 @@ class TaskStore:
                 if not record.is_terminal:
                     record.state = TASK_STATE_CANCELLED
                     record.finished_at = time.time()
+                    self._append_event({
+                        "event": "cancel",
+                        "task_id": record.task_id,
+                        "finished_at": record.finished_at,
+                        "cancel_hint": record.cancel_hint,
+                    })
                     record._done_event.set()
         else:
             if not record.is_terminal:
                 record.state = TASK_STATE_CANCELLED
                 record.finished_at = time.time()
+                self._append_event({
+                    "event": "cancel",
+                    "task_id": record.task_id,
+                    "finished_at": record.finished_at,
+                    "cancel_hint": record.cancel_hint,
+                })
                 record._done_event.set()
         return record
 
@@ -273,9 +444,20 @@ _STORE: TaskStore | None = None
 
 
 def get_task_store() -> TaskStore:
+    """返回进程级共享 TaskStore，按需懒加载。
+
+    首次调用时读取 ``config.task_store_path``：非空则启用 JSONL 持久化并 replay
+    历史任务；空则保持纯内存模式。后续修改环境变量需先调用 ``reset_task_store``。
+    """
     global _STORE
     if _STORE is None:
-        _STORE = TaskStore()
+        storage_path: Path | None = None
+        try:
+            from .config import config as _config  # 延迟 import 防循环
+            storage_path = _config.task_store_path
+        except Exception:
+            storage_path = None
+        _STORE = TaskStore(storage_path=storage_path)
     return _STORE
 
 
