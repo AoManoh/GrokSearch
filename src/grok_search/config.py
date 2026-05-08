@@ -183,6 +183,28 @@ class Config:
         return os.getenv("GROK_LOG_LEVEL", "INFO").upper()
 
     @property
+    def batch_auto_async_threshold(self) -> int:
+        """``web_search_batch`` 自动转异步任务的 batch size 阈值。
+
+        - 0（默认）：关闭，行为与旧版本一致，所有 batch 同步执行。
+        - >0：当 ``len(queries) >= threshold`` 时，``web_search_batch`` 内部直接
+          调用 ``submit_search_task`` 路径并立即返回 task_id，避免长 batch
+          阻塞主调用通道。AI 调用方可通过 ``auto_async_threshold`` 参数覆盖。
+
+        默认 0 是为了向后兼容：未来如果改成默认开启，需要在 README 与工具描述
+        里同步说明，并且让现有调用方有机会显式传 0 关闭。
+        """
+        try:
+            value = int(os.getenv("GROK_BATCH_AUTO_ASYNC_THRESHOLD", "0"))
+        except ValueError:
+            value = 0
+        if value < 0:
+            return 0
+        if value > 32:
+            return 32
+        return value
+
+    @property
     def task_store_path(self) -> Path | None:
         """任务存储 JSONL 落盘路径。
 

@@ -780,6 +780,15 @@ async def _perform_web_search(
     - queries length is capped at 32; extra entries are dropped and a warning is returned.
     - Empty / whitespace-only and non-string entries are reported in dropped metadata.
     - Obvious low-information queries return status="skipped" without calling upstream.
+
+    Auto-async routing:
+    - When ``auto_async_threshold > 0`` and ``len(queries) >= auto_async_threshold``,
+      the call is automatically routed through ``submit_search_task`` and returns
+      immediately with ``{status: "submitted", task_id, batch_size}`` instead of
+      blocking until all sub-queries finish. Use ``get_search_task_result`` with
+      a Go-style ``wait`` to retrieve the final batch payload. Default 0 keeps
+      synchronous behavior for backward compatibility; env ``GROK_BATCH_AUTO_ASYNC_THRESHOLD``
+      can change the default. Pass 0 explicitly to force synchronous execution.
     """,
     meta={"version": "1.0.0", "author": "guda.studio"},
 )
@@ -789,7 +798,40 @@ async def web_search_batch(
     model: Annotated[str, "Optional shared model ID applied to every query."] = "",
     extra_sources: Annotated[int, "Number of additional reference results from Tavily/Firecrawl per query. Set 0 to disable. Default 0."] = 0,
     timeout: Annotated[str, "Optional per-query upstream timeout as a Go-style duration (e.g. '30s', '2m'). Applied independently to each query in the batch — a single hung upstream cannot stall the rest. Empty/'0s' falls back to GROK_REQUEST_TIMEOUT (currently 120s, env-tunable). Hard ceiling 10m. Timed-out queries return error.code='upstream_timeout' with retryable=true; siblings continue normally."] = "",
+    auto_async_threshold: Annotated[int, "When >0 and len(queries) >= threshold, the batch is auto-submitted as a background task; the call returns immediately with {status: 'submitted', task_id, batch_size}. Use get_search_task_result(task_id, wait='30s') to fetch the final payload. Default -1 means 'use server default GROK_BATCH_AUTO_ASYNC_THRESHOLD'. Pass 0 to force synchronous, or any positive integer to override."] = -1,
 ) -> dict:
+    # 解析 auto-async 阈值：参数 -1 走 server 默认；其它值（含 0）原样使用。
+    if auto_async_threshold is None or auto_async_threshold < 0:
+        threshold = config.batch_auto_async_threshold
+    else:
+        threshold = min(int(auto_async_threshold), 32)
+
+    if threshold > 0 and isinstance(queries, list):
+        # 注意：长度判断只看输入数量，不看实际能跑多少（dropped/over_limit 由
+        # 同步路径在 batch 内部处理）；这里只做"是否值得异步"的粗判。
+        valid_count = sum(1 for q in queries if isinstance(q, str) and q.strip())
+        if valid_count >= threshold:
+            params = {
+                "queries": list(queries),
+                "platform": platform,
+                "model": model,
+                "extra_sources": extra_sources,
+                "timeout": timeout,
+            }
+            runner = _build_task_runner("web_search_batch", params)
+            record = await get_task_store().submit(
+                kind="web_search_batch", params=params, runner=runner
+            )
+            payload = record.to_public_dict()
+            payload["status"] = "submitted"
+            payload["batch_size"] = valid_count
+            payload["auto_async_threshold"] = threshold
+            payload["hint"] = (
+                f"Batch with {valid_count} queries auto-routed to background task. "
+                f"Call get_search_task_result(task_id={record.task_id!r}, wait='30s') to fetch the final payload."
+            )
+            return payload
+
     return await _perform_web_search_batch(
         queries=queries,
         platform=platform,

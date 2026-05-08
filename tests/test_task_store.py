@@ -1,4 +1,7 @@
-"""TaskStore 与 submit/get/cancel/list 4 个 MCP 工具的回归测试。"""
+"""TaskStore 与 submit/get/cancel/list 4 个 MCP 工具的回归测试。
+
+也覆盖 web_search_batch 的 auto_async_threshold 路由行为。
+"""
 
 from __future__ import annotations
 
@@ -93,6 +96,81 @@ def _install_stub_provider(monkeypatch, *, delay: float = 0.0, fail_query: str |
 )
 def test_parse_go_duration_handles_common_inputs(value, expected):
     assert parse_go_duration(value) == pytest.approx(expected)
+
+
+@pytest.mark.asyncio
+async def test_batch_auto_async_below_threshold_runs_synchronously(monkeypatch):
+    """auto_async_threshold=5 + 3 个 query 应走同步路径，返回完整 results。"""
+    _set_basic_env(monkeypatch)
+    _install_stub_provider(monkeypatch, delay=0.05)
+
+    response = await server.web_search_batch(
+        queries=["q1", "q2", "q3"],
+        auto_async_threshold=5,
+    )
+
+    assert response.get("status") != "submitted", response
+    assert response["batch_size"] == 3
+    assert response["ok_count"] == 3
+    assert "results" in response
+    assert "task_id" not in response
+
+
+@pytest.mark.asyncio
+async def test_batch_auto_async_at_threshold_returns_task_id(monkeypatch):
+    """auto_async_threshold=3 + 3 个 query 应触发异步路由，立即返回 task_id。"""
+    _set_basic_env(monkeypatch)
+    _install_stub_provider(monkeypatch, delay=0.5)
+
+    started = time.perf_counter()
+    response = await server.web_search_batch(
+        queries=["q1", "q2", "q3"],
+        auto_async_threshold=3,
+    )
+    elapsed = time.perf_counter() - started
+
+    assert response["status"] == "submitted", response
+    assert response["batch_size"] == 3
+    assert response["auto_async_threshold"] == 3
+    assert response["task_id"].startswith("task-")
+    assert "hint" in response
+    # 同步路径会等 0.5s × 3 query / concurrency=4 ≈ 0.5s，异步路径应立即返回
+    assert elapsed < 0.2, f"async submit should be immediate (elapsed={elapsed:.2f}s)"
+
+    # 后续可通过 task_id 取最终结果
+    final = await server.get_search_task_result(task_id=response["task_id"], wait="3s")
+    assert final["state"] == TASK_STATE_COMPLETED
+    assert final["result"]["ok_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_batch_auto_async_threshold_zero_forces_sync(monkeypatch):
+    """显式传 auto_async_threshold=0 应强制同步执行，即使 env 默认开启。"""
+    monkeypatch.setenv("GROK_BATCH_AUTO_ASYNC_THRESHOLD", "2")
+    _set_basic_env(monkeypatch)
+    _install_stub_provider(monkeypatch, delay=0.02)
+
+    response = await server.web_search_batch(
+        queries=["q1", "q2", "q3"],
+        auto_async_threshold=0,
+    )
+
+    assert response.get("status") != "submitted", response
+    assert "results" in response
+    assert response["ok_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_batch_auto_async_default_uses_env(monkeypatch):
+    """auto_async_threshold 不传时应从 env 读默认值。"""
+    monkeypatch.setenv("GROK_BATCH_AUTO_ASYNC_THRESHOLD", "2")
+    _set_basic_env(monkeypatch)
+    _install_stub_provider(monkeypatch, delay=0.5)
+
+    response = await server.web_search_batch(queries=["q1", "q2"])
+
+    assert response["status"] == "submitted", response
+    assert response["auto_async_threshold"] == 2
 
 
 @pytest.mark.asyncio
