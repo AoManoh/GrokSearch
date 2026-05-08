@@ -485,6 +485,101 @@ async def test_timeout_does_not_count_semaphore_queue_wait(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_retry_backoff_releases_semaphore_slot_at_provider_level(monkeypatch):
+    """provider 层 _execute_stream_with_retry 的 retry 退避不应持锁（无外层 hold 场景）。
+
+    server 主路径用 ``hold_grok_semaphore`` 在 wait_for 外整体持锁（P0 修复），
+    所以 provider 层 ``maybe_acquire_grok_semaphore`` 是 no-op；本测试覆盖
+    **没有外层 hold** 的内部辅助路径（如 describe_url / rank_sources，或者
+    单元测试直接调 provider）：
+
+    - concurrency=1 + 两个独立 GrokSearchProvider 调用
+    - call A 第一次 attempt 抛 retryable 502，进入 ~0.6s 退避，单次上游 0.4s
+    - call B 单次成功上游 0.4s
+
+    - 旧实现（retry 在 sem 内）：A 持锁覆盖 retry 全程 ≥ 0.4 + 0.6 + 0.4 = 1.4s，
+      B 必须等 A 释放 sem 后才开始 → 总 ≥ 1.8s
+    - 新实现（retry 在 sem 外，每次 attempt 单独 acquire）：A 退避期间 release
+      sem，B acquire 进入并完成 → 总 ≈ max(A 总耗时, B + 排队≈0)
+      ≈ 1.4s
+    """
+    import httpx
+    from grok_search.providers import grok as grok_provider_mod
+    from grok_search.providers.grok import GrokSearchProvider
+
+    monkeypatch.setenv("GROK_CONCURRENCY", "1")
+    monkeypatch.setenv("GROK_RETRY_MAX_ATTEMPTS", "1")  # 总共 2 次 attempt
+    monkeypatch.setenv("GROK_RETRY_MULTIPLIER", "0.6")
+    monkeypatch.setenv("GROK_RETRY_MAX_WAIT", "2")
+    reset_grok_semaphore()
+    await grok_provider_mod.reset_shared_async_client()
+
+    state = {"stream_started": 0, "fail_first_done": False}
+
+    class _FakeStreamContext:
+        def __init__(self, succeed: bool, delay: float):
+            self._succeed = succeed
+            self._delay = delay
+
+        async def __aenter__(self):
+            await asyncio.sleep(self._delay)
+            if not self._succeed:
+                raise httpx.HTTPStatusError(
+                    "502 bad gateway",
+                    request=httpx.Request("POST", "https://example.test/v1/chat/completions"),
+                    response=httpx.Response(502),
+                )
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+        async def aiter_lines(self):
+            yield 'data: {"choices":[{"delta":{"content":"ok"}}]}'
+            yield "data: [DONE]"
+
+    class _FakeClient:
+        is_closed = False
+
+        def stream(self, method, url, headers=None, json=None):
+            state["stream_started"] += 1
+            last_msg = json["messages"][-1].get("content", "") if json and json.get("messages") else ""
+            is_call_a = "call_A" in last_msg
+            if is_call_a and not state["fail_first_done"]:
+                state["fail_first_done"] = True
+                return _FakeStreamContext(succeed=False, delay=0.4)
+            return _FakeStreamContext(succeed=True, delay=0.4)
+
+    fake_client = _FakeClient()
+
+    async def _fake_get_client():
+        return fake_client
+
+    monkeypatch.setattr(grok_provider_mod, "get_shared_async_client", _fake_get_client)
+
+    provider = GrokSearchProvider("https://example.test/v1", "key", "grok-4.1-fast")
+
+    started = time.perf_counter()
+    results = await asyncio.gather(
+        provider.search("call_A"),
+        provider.search("call_B"),
+    )
+    elapsed = time.perf_counter() - started
+
+    # 旧实现 ≥ 1.8s；新实现应该 ≤ 1.6s（两条并发，max ≈ 1.4s + 调度抖动）
+    assert elapsed < 1.7, (
+        f"provider-level retry backoff still holds slot (elapsed={elapsed:.2f}s)"
+    )
+    assert all(r for r in results), f"results: {results}"
+    assert state["stream_started"] >= 3, "expected ≥3 stream calls (A fail + A retry + B)"
+
+    await grok_provider_mod.reset_shared_async_client()
+
+
+@pytest.mark.asyncio
 async def test_provider_semaphore_caps_concurrent_upstream(monkeypatch):
     _set_basic_env(monkeypatch, concurrency=2)
     reset_grok_semaphore()

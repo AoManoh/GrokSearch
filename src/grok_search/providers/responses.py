@@ -187,17 +187,19 @@ class ResponsesSearchProvider(BaseSearchProvider):
         return response
 
     async def _execute_with_retry(self, headers: dict, payload: dict) -> dict[str, Any]:
-        # 同步 grok.py 的修复：让外层超时不被 Semaphore 排队时间污染。
-        # 用共享 AsyncClient 复用连接池，避免每次新建 client 重做 TLS 握手。
-        async with maybe_acquire_grok_semaphore():
-            client = await get_shared_async_client()
-            async for attempt in AsyncRetrying(
-                stop=stop_after_attempt(config.retry_max_attempts + 1),
-                wait=_WaitWithRetryAfter(config.retry_multiplier, config.retry_max_wait),
-                retry=retry_if_exception(_is_retryable_exception),
-                reraise=True,
-            ):
-                with attempt:
+        # 同步 grok.py 的两处修复：
+        # 1. 用共享 AsyncClient 复用连接池，避免每次新建 client 重做 TLS 握手。
+        # 2. Semaphore acquire 收缩到单次 attempt 内，让 tenacity 退避 sleep
+        #    不持锁，避免 429 / Retry-After 期间绑死并发槽位。
+        client = await get_shared_async_client()
+        async for attempt in AsyncRetrying(
+            stop=stop_after_attempt(config.retry_max_attempts + 1),
+            wait=_WaitWithRetryAfter(config.retry_multiplier, config.retry_max_wait),
+            retry=retry_if_exception(_is_retryable_exception),
+            reraise=True,
+        ):
+            with attempt:
+                async with maybe_acquire_grok_semaphore():
                     response = await client.post(
                         f"{self.api_url.rstrip('/')}/responses",
                         headers=headers,

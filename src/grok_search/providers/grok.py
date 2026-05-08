@@ -383,19 +383,23 @@ class GrokSearchProvider(BaseSearchProvider):
         使用模块级共享 ``AsyncClient`` 复用 TCP/TLS 连接池，避免每次 query
         重新握手；Semaphore 限流仍由 ``maybe_acquire_grok_semaphore`` 控制业务
         并发，与连接池上限解耦。
+
+        **slot 收缩**：把 acquire 放在单次 attempt 内（HTTP 请求时持锁、
+        请求结束后立即释放），AsyncRetrying 的退避 sleep 不持锁。这样遇到
+        429 + ``Retry-After: 30s`` 等场景时，30 秒等待期间不会绑死并发槽位，
+        其他 query 可以正常进入。配合外层 ``hold_grok_semaphore``：外层已持锁
+        时内层是 no-op，仍由外层覆盖整个 retry 循环；未持锁的内部辅助调用
+        （describe_url / rank_sources 等）则按 attempt 粒度让出 slot。
         """
-        # 注意：用 maybe_acquire_grok_semaphore，让外层在 asyncio.wait_for 之外
-        # 通过 hold_grok_semaphore 提前持锁的场景能复用 slot；否则保持原有
-        # 限流语义。这是 2026-05-06 stress test P0 修复的内层一半。
-        async with maybe_acquire_grok_semaphore():
-            client = await get_shared_async_client()
-            async for attempt in AsyncRetrying(
-                stop=stop_after_attempt(config.retry_max_attempts + 1),
-                wait=_WaitWithRetryAfter(config.retry_multiplier, config.retry_max_wait),
-                retry=retry_if_exception(_is_retryable_exception),
-                reraise=True,
-            ):
-                with attempt:
+        client = await get_shared_async_client()
+        async for attempt in AsyncRetrying(
+            stop=stop_after_attempt(config.retry_max_attempts + 1),
+            wait=_WaitWithRetryAfter(config.retry_multiplier, config.retry_max_wait),
+            retry=retry_if_exception(_is_retryable_exception),
+            reraise=True,
+        ):
+            with attempt:
+                async with maybe_acquire_grok_semaphore():
                     async with client.stream(
                         "POST",
                         f"{self.api_url}/chat/completions",
