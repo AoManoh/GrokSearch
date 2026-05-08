@@ -44,6 +44,80 @@ def _isolate_semaphore():
 
 
 @pytest.mark.asyncio
+async def test_cancelled_batch_returns_status_cancelled_per_query(monkeypatch):
+    """外层 cancel batch 时，每个 in-flight query 应映射为 status=cancelled，
+    error.code=cancelled，retryable=true，而不是被错认为 internal_error。"""
+    _set_basic_env(monkeypatch, concurrency=4)
+
+    async def fake_models(api_url: str, api_key: str) -> list[str]:
+        return ["grok-4.1-fast"]
+
+    started = asyncio.Event()
+
+    class HangingProvider:
+        def __init__(self, api_url: str, api_key: str, model: str):
+            self.model = model
+
+        async def search(self, query: str, platform: str = "") -> str:
+            started.set()
+            await asyncio.sleep(60)  # 永远不会真返回
+            return f"answer for {query}"
+
+        def get_provider_name(self) -> str:
+            return "Grok"
+
+    monkeypatch.setattr(server, "_get_available_models_cached", fake_models)
+    monkeypatch.setattr(server, "GrokSearchProvider", HangingProvider)
+
+    batch_task = asyncio.create_task(
+        server.web_search_batch(queries=["alpha", "beta", "gamma"], timeout="30s")
+    )
+    # 等至少一个 in-flight，再外层 cancel；与 task_store.cancel 走的路径完全一致。
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    await asyncio.sleep(0.05)
+    batch_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await batch_task
+
+
+@pytest.mark.asyncio
+async def test_cancelled_inside_gather_is_classified_as_cancelled(monkeypatch):
+    """直接在单个 query 抛 CancelledError，验证 batch 路径把它分类为 cancelled
+    而非 internal_error。这覆盖 task_store.cancel() 引起的真实场景。"""
+    _set_basic_env(monkeypatch)
+
+    async def cancel_one_pass_others(query, **_kwargs):
+        if query == "cancel_me":
+            raise asyncio.CancelledError()
+        return {
+            "session_id": f"sess-{query}",
+            "status": "ok",
+            "content": f"answer for {query}",
+            "sources_count": 0,
+            "model": "grok-4.1-fast",
+            "provider": "Grok",
+        }
+
+    monkeypatch.setattr(server, "_perform_web_search", cancel_one_pass_others)
+
+    response = await server._perform_web_search_batch(
+        queries=["alpha", "cancel_me", "gamma"]
+    )
+
+    statuses = {item["query"]: item["status"] for item in response["results"]}
+    assert statuses == {"alpha": "ok", "cancel_me": "cancelled", "gamma": "ok"}
+    assert response["cancelled_count"] == 1
+    assert response["error_count"] == 0
+    assert response["ok_count"] == 2
+
+    cancelled = next(r for r in response["results"] if r["status"] == "cancelled")
+    assert cancelled["error"]["code"] == "cancelled"
+    assert cancelled["error"]["retryable"] is True
+    assert cancelled["error"]["provider"] == "server"
+
+
+@pytest.mark.asyncio
 async def test_batch_returns_per_query_results_with_isolation(monkeypatch):
     _set_basic_env(monkeypatch)
 

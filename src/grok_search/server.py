@@ -863,6 +863,23 @@ async def _perform_web_search_batch(
         input_index = candidate["index"]
         if isinstance(item, dict):
             result = dict(item)
+        elif isinstance(item, asyncio.CancelledError):
+            # 外层 task.cancel() 触发 gather 把 CancelledError 收回时，应保留
+            # cancelled 语义而非伪装成 internal_error；error.code 用 "cancelled"
+            # 让上层调用方区分"被主动中止"与"代码异常"。
+            sid = new_session_id()
+            result = {
+                "session_id": sid,
+                "status": "cancelled",
+                "content": f"web_search 已取消 (query={q!r})",
+                "sources_count": 0,
+                "error": {
+                    "code": "cancelled",
+                    "message": "请求被取消，未到达终态。",
+                    "provider": "server",
+                    "retryable": True,
+                },
+            }
         elif isinstance(item, BaseException):
             result = _build_client_error(
                 new_session_id(),
@@ -890,6 +907,9 @@ async def _perform_web_search_batch(
     error_count = sum(
         1 for r in results if isinstance(r, dict) and r.get("status") == "error"
     )
+    cancelled_count = sum(
+        1 for r in results if isinstance(r, dict) and r.get("status") == "cancelled"
+    )
 
     response: dict = {
         "input_size": input_size,
@@ -901,6 +921,7 @@ async def _perform_web_search_batch(
         "ok_count": ok_count,
         "skipped_count": skipped_count,
         "error_count": error_count,
+        "cancelled_count": cancelled_count,
         "results": results,
     }
     if truncated:
