@@ -6,7 +6,12 @@ from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt
 
 from .base import BaseSearchProvider, SearchResponse
 from ._concurrency import get_grok_semaphore, maybe_acquire_grok_semaphore
-from .grok import _WaitWithRetryAfter, _is_retryable_exception, get_local_time_info
+from .grok import (
+    _WaitWithRetryAfter,
+    _is_retryable_exception,
+    get_local_time_info,
+    get_shared_async_client,
+)
 from ..config import config
 from ..logger import log_info
 from ..sources import merge_sources, split_answer_and_sources
@@ -182,22 +187,22 @@ class ResponsesSearchProvider(BaseSearchProvider):
         return response
 
     async def _execute_with_retry(self, headers: dict, payload: dict) -> dict[str, Any]:
-        timeout = httpx.Timeout(connect=6.0, read=120.0, write=10.0, pool=None)
         # 同步 grok.py 的修复：让外层超时不被 Semaphore 排队时间污染。
+        # 用共享 AsyncClient 复用连接池，避免每次新建 client 重做 TLS 握手。
         async with maybe_acquire_grok_semaphore():
-            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-                async for attempt in AsyncRetrying(
-                    stop=stop_after_attempt(config.retry_max_attempts + 1),
-                    wait=_WaitWithRetryAfter(config.retry_multiplier, config.retry_max_wait),
-                    retry=retry_if_exception(_is_retryable_exception),
-                    reraise=True,
-                ):
-                    with attempt:
-                        response = await client.post(
-                            f"{self.api_url.rstrip('/')}/responses",
-                            headers=headers,
-                            json=payload,
-                        )
-                        response.raise_for_status()
-                        return response.json()
+            client = await get_shared_async_client()
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(config.retry_max_attempts + 1),
+                wait=_WaitWithRetryAfter(config.retry_multiplier, config.retry_max_wait),
+                retry=retry_if_exception(_is_retryable_exception),
+                reraise=True,
+            ):
+                with attempt:
+                    response = await client.post(
+                        f"{self.api_url.rstrip('/')}/responses",
+                        headers=headers,
+                        json=payload,
+                    )
+                    response.raise_for_status()
+                    return response.json()
         return {}

@@ -94,14 +94,7 @@ async def test_responses_provider_posts_to_responses_endpoint(monkeypatch):
             return {"output_text": "ok", "citations": ["https://example.com"]}
 
     class FakeClient:
-        def __init__(self, *args, **kwargs):
-            return None
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return None
+        is_closed = False
 
         async def post(self, url, headers=None, json=None):
             captured["url"] = url
@@ -109,7 +102,14 @@ async def test_responses_provider_posts_to_responses_endpoint(monkeypatch):
             captured["payload"] = json
             return FakeResponse()
 
-    monkeypatch.setattr("grok_search.providers.responses.httpx.AsyncClient", FakeClient)
+    fake = FakeClient()
+
+    async def _fake_get_client():
+        return fake
+
+    monkeypatch.setattr(
+        "grok_search.providers.responses.get_shared_async_client", _fake_get_client
+    )
     monkeypatch.setenv("GROK_RETRY_MAX_ATTEMPTS", "0")
     provider = ResponsesSearchProvider("https://api.x.ai/v1", "key", "grok-4.20-reasoning")
 

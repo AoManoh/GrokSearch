@@ -1,3 +1,4 @@
+import asyncio
 import httpx
 import json
 import re
@@ -13,6 +14,98 @@ from ..utils import search_prompt, fetch_prompt, url_describe_prompt, rank_sourc
 from ..logger import log_info
 from ..config import config
 from ..sources import split_answer_and_sources
+
+
+# 进程级共享的 httpx.AsyncClient，用于复用 TCP/TLS 连接池。
+#
+# 早先版本在 _execute_stream_with_retry 内部 `async with httpx.AsyncClient(...)`
+# 每次新建 client，每个 query 都要重新做 DNS / TCP / TLS 握手，单 query 增加
+# 100-300ms 固定开销；高 batch 场景下握手时间被串行化，等效降低有效并发度。
+#
+# 改动后：模块级一个 AsyncClient 单例，共享连接池 + HTTP/2 多路复用（如果上游
+# 协商成功）。timeout 与 limits 在创建时设置好，业务侧不再重复传。
+#
+# 生命周期：进程退出时 asyncio 会自动回收；显式 close 由 reset_shared_client
+# 提供给测试。
+_SHARED_CLIENT: httpx.AsyncClient | None = None
+# 记录 client 关联的 event loop，用于跨 loop 测试场景下判定是否需要重建。
+# 生产环境只有一个 loop，所以这里几乎是空开销；测试每个用例都有独立 loop，
+# 不做这个保护就会触发 "Event loop is closed" 类型的伪故障。
+_SHARED_CLIENT_LOOP_ID: int | None = None
+_SHARED_CLIENT_LOCK: asyncio.Lock | None = None
+_DEFAULT_HTTPX_TIMEOUT = httpx.Timeout(connect=6.0, read=120.0, write=10.0, pool=30.0)
+_DEFAULT_HTTPX_LIMITS = httpx.Limits(
+    max_connections=64,
+    max_keepalive_connections=32,
+    keepalive_expiry=30.0,
+)
+
+
+def _current_loop_id() -> int:
+    return id(asyncio.get_running_loop())
+
+
+def _get_shared_client_lock() -> asyncio.Lock:
+    """asyncio.Lock 也绑定 loop，所以同样按需懒加载，并在 loop 切换时重建。"""
+    global _SHARED_CLIENT_LOCK
+    loop_id = _current_loop_id()
+    if _SHARED_CLIENT_LOCK is None or getattr(_SHARED_CLIENT_LOCK, "_loop_id", None) != loop_id:
+        lock = asyncio.Lock()
+        # 注解一下绑定的 loop_id；asyncio.Lock 没有公开 loop 字段，此处用属性补丁
+        # 不影响其行为，仅用于跨 loop 判定。
+        try:
+            object.__setattr__(lock, "_loop_id", loop_id)
+        except Exception:
+            pass
+        _SHARED_CLIENT_LOCK = lock
+    return _SHARED_CLIENT_LOCK
+
+
+async def get_shared_async_client() -> httpx.AsyncClient:
+    """返回进程级共享 AsyncClient，按需懒加载。
+
+    多次调用在同一 event loop 内返回同一实例；event loop 切换（例如测试每个
+    用例独立 loop）时会自动重建，避免跨 loop 使用同一个 client 触发
+    "Event loop is closed"。Semaphore 限流在外层（``_concurrency.py``）独立
+    控制业务并发，连接池只是复用底层 socket，与限流互不耦合。
+    """
+    global _SHARED_CLIENT, _SHARED_CLIENT_LOOP_ID
+    loop_id = _current_loop_id()
+    if _SHARED_CLIENT is not None and _SHARED_CLIENT_LOOP_ID == loop_id and not _SHARED_CLIENT.is_closed:
+        return _SHARED_CLIENT
+    lock = _get_shared_client_lock()
+    async with lock:
+        if (
+            _SHARED_CLIENT is None
+            or _SHARED_CLIENT_LOOP_ID != loop_id
+            or _SHARED_CLIENT.is_closed
+        ):
+            _SHARED_CLIENT = httpx.AsyncClient(
+                timeout=_DEFAULT_HTTPX_TIMEOUT,
+                limits=_DEFAULT_HTTPX_LIMITS,
+                follow_redirects=True,
+            )
+            _SHARED_CLIENT_LOOP_ID = loop_id
+        return _SHARED_CLIENT
+
+
+async def reset_shared_async_client() -> None:
+    """关闭并丢弃共享 client，仅供测试或显式重新加载使用。
+
+    跨 event loop 的清理是幂等且容错的：如果 client 关联的 loop 已经关闭，
+    aclose 可能抛 RuntimeError，这里吞掉，因为底层资源已随 loop 一起释放。
+    """
+    global _SHARED_CLIENT, _SHARED_CLIENT_LOOP_ID
+    client = _SHARED_CLIENT
+    _SHARED_CLIENT = None
+    _SHARED_CLIENT_LOOP_ID = None
+    if client is None or client.is_closed:
+        return
+    try:
+        await client.aclose()
+    except RuntimeError:
+        # event loop 已关闭等场景下忽略；连接资源会随 loop 一起回收。
+        pass
 
 
 def get_local_time_info() -> str:
@@ -285,29 +378,32 @@ class GrokSearchProvider(BaseSearchProvider):
         return content
 
     async def _execute_stream_with_retry(self, headers: dict, payload: dict, ctx=None) -> str:
-        """执行带重试机制的流式 HTTP 请求"""
-        timeout = httpx.Timeout(connect=6.0, read=120.0, write=10.0, pool=None)
+        """执行带重试机制的流式 HTTP 请求。
 
+        使用模块级共享 ``AsyncClient`` 复用 TCP/TLS 连接池，避免每次 query
+        重新握手；Semaphore 限流仍由 ``maybe_acquire_grok_semaphore`` 控制业务
+        并发，与连接池上限解耦。
+        """
         # 注意：用 maybe_acquire_grok_semaphore，让外层在 asyncio.wait_for 之外
         # 通过 hold_grok_semaphore 提前持锁的场景能复用 slot；否则保持原有
         # 限流语义。这是 2026-05-06 stress test P0 修复的内层一半。
         async with maybe_acquire_grok_semaphore():
-            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-                async for attempt in AsyncRetrying(
-                    stop=stop_after_attempt(config.retry_max_attempts + 1),
-                    wait=_WaitWithRetryAfter(config.retry_multiplier, config.retry_max_wait),
-                    retry=retry_if_exception(_is_retryable_exception),
-                    reraise=True,
-                ):
-                    with attempt:
-                        async with client.stream(
-                            "POST",
-                            f"{self.api_url}/chat/completions",
-                            headers=headers,
-                            json=payload,
-                        ) as response:
-                            response.raise_for_status()
-                            return await self._parse_streaming_response(response, ctx)
+            client = await get_shared_async_client()
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(config.retry_max_attempts + 1),
+                wait=_WaitWithRetryAfter(config.retry_multiplier, config.retry_max_wait),
+                retry=retry_if_exception(_is_retryable_exception),
+                reraise=True,
+            ):
+                with attempt:
+                    async with client.stream(
+                        "POST",
+                        f"{self.api_url}/chat/completions",
+                        headers=headers,
+                        json=payload,
+                    ) as response:
+                        response.raise_for_status()
+                        return await self._parse_streaming_response(response, ctx)
 
     async def describe_url(self, url: str, ctx=None) -> dict:
         """让 Grok 阅读单个 URL 并返回 title + extracts"""
