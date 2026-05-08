@@ -657,18 +657,32 @@ async def _perform_web_search(
         except Exception as exc:
             return SearchResponse(provider=provider_mode, model=effective_model), _build_upstream_error(session_id, exc)
 
+    # 额外信源失败诊断：保留 (provider_name, exc_type, message) 让上层写入 warning，
+    # 避免上游 401/429/timeout 被静默吞噬导致用户误以为只是 Grok 主搜没命中。
+    extra_failures: list[dict] = []
+
     async def _safe_tavily() -> list[dict] | None:
         try:
             if tavily_count:
                 return await _call_tavily_search(query_text, tavily_count)
-        except Exception:
+        except Exception as exc:
+            extra_failures.append({
+                "provider": "tavily",
+                "type": type(exc).__name__,
+                "message": str(exc) or repr(exc),
+            })
             return None
 
     async def _safe_firecrawl() -> list[dict] | None:
         try:
             if firecrawl_count:
                 return await _call_firecrawl_search(query_text, firecrawl_count)
-        except Exception:
+        except Exception as exc:
+            extra_failures.append({
+                "provider": "firecrawl",
+                "type": type(exc).__name__,
+                "message": str(exc) or repr(exc),
+            })
             return None
 
     coros: list = [_safe_grok()]
@@ -699,6 +713,8 @@ async def _perform_web_search(
         grok_error["sources_count"] = len(all_sources)
         if all_sources:
             grok_error["warning"] = "Grok 主搜索失败，仅缓存了额外信源，未生成主回答。"
+        if extra_failures:
+            grok_error["extra_failures"] = extra_failures
         return grok_error
 
     status = "ok"
@@ -720,6 +736,17 @@ async def _perform_web_search(
     }
     if warning:
         result["warning"] = warning
+    if extra_failures:
+        # 配置了 extra_sources 但 tavily/firecrawl 调用抛了异常时，把失败原因显式带回，
+        # 避免调用方误以为只是上游没命中信源；同时不把它升级成 status=error，
+        # 因为 Grok 主搜本身已成功，外部信源只是补强。
+        names = sorted({f["provider"] for f in extra_failures})
+        existing_warning = result.get("warning")
+        extra_warning = f"额外信源失败: {', '.join(names)}"
+        result["warning"] = (
+            f"{existing_warning}; {extra_warning}" if existing_warning else extra_warning
+        )
+        result["extra_failures"] = extra_failures
     return result
 
 
